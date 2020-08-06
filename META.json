@@ -1,0 +1,34 @@
+{
+    "name": "ocgeo_fdw",
+    "abstract": "PostgreSQL Data Wrappper to ocgeo databases",
+    "description": "With this Data Wrapper you can access the OpenCageData API",
+    "version": "1.0.0",
+    "maintainer": [
+      "Stelios Sfakianakis <sgsfak@gmail.com>"
+   ],
+    "license": "postgresql",
+    "provides": {
+        "ocgeo_fdw": {
+            "abstract": "PostgreSQL Data Wrappper to the OpenCageData API",
+            "file": "sql/ocgeo_fdw.sql",
+            "docfile": "doc/ocgeo_fdw.md",
+            "version": "1.0.0"
+        }
+    },
+    "resources": {
+      "repository": {
+        "url":  "https://github.com/sgsfak/ocgeo_fdw.git",
+        "web":  "https://github.com/sgsfak/ocgeo_fdw",
+        "type": "git"
+      }
+   },
+    "generated_by": "Stelios Sfakianakis",
+    "meta-spec": {
+        "version": "1.0.0",
+        "url": "http://pgxn.org/meta/spec.txt"
+    },
+    "tags": [
+      "OpenCageData API Wrapper",
+      "foreign data wrapper"
+   ]
+}
