@@ -46,6 +46,13 @@
 #include "nodes/nodeFuncs.h"
 #include "nodes/pg_list.h"
 
+#if PG_VERSION_NUM < 120000
+#include "nodes/relation.h"
+#include "optimizer/var.h"
+#endif
+#if PG_VERSION_NUM >= 120000
+#include "optimizer/optimizer.h"
+#endif
 // #include "nodes/pathnodes.h"
 #include "nodes/parsenodes.h"
 // #include "optimizer/optimizer.h"
@@ -60,6 +67,7 @@
 #include "utils/rel.h"
 
 #include "ocgeo_api.h"
+#include "cJSON.h"
 
 PG_MODULE_MAGIC;
 
@@ -232,34 +240,6 @@ exitHook (int code, Datum arg)
   /* Cleanup? */
 }
 
-static void * my_pcalloc(size_t nmemb, size_t size);
-
-/* Postgres C lacks a calloc version for memory allocation. The following
- * has been adopted from the OpenBSD code, which addresses integer overflow
- * errors, see http://bxr.su/OpenBSD/lib/libc/stdlib/malloc.c#1722
- */
-void *
-my_pcalloc(size_t nmemb, size_t size)
-{
-    void *r = NULL;
-
-/*
- * This is sqrt(SIZE_MAX+1), as s1*s2 <= SIZE_MAX
- * if both s1 < MUL_NO_OVERFLOW and s2 < MUL_NO_OVERFLOW
- */
-#   define MUL_NO_OVERFLOW (1UL << (sizeof(size_t) * 4))
-
-    if ((nmemb >= MUL_NO_OVERFLOW || size >= MUL_NO_OVERFLOW) &&
-        nmemb > 0 && SIZE_MAX / nmemb < size) {
-        elog(ERROR, "invalid memory alloc request for %zu elements of size %zu each", nmemb, size);
-        return NULL;
-    }
-
-    size *= nmemb;
-    r = palloc0(size * nmemb);
-    return r;
-}
-
 /*
  * _PG_init
  *      Library load-time initalization.
@@ -267,14 +247,11 @@ my_pcalloc(size_t nmemb, size_t size)
  */
 void _PG_init (void)
 {
+    elog(DEBUG1,"function %s, before curl global init",__func__);
+
     // register an exit hook 
     // on_proc_exit (&exitHook, PointerGetDatum (NULL));
 
-    /* We set the CURL memory handlers to be the ones provided by Postgres
-       plus the "pcalloc" one we wrote */
-
-    elog(DEBUG1,"function %s, before curl global init",__func__);
-    //curl_global_init_mem(CURL_GLOBAL_ALL, palloc, pfree, repalloc, pstrdup, my_pcalloc);
     curl_global_init(CURL_GLOBAL_ALL);
     elog(DEBUG1,"function %s, after curl global init",__func__);
 }
@@ -340,7 +317,7 @@ static HTAB *ocgeo_hash = NULL;
 static void ocgeoGetOptions(Oid foreigntableid, ocgeoTableOptions *options);
 static void ocgeoGetQual(Node *node, TupleDesc tupdesc, char **key,
     char **value, bool *pushdown);
-static Counters * GetCounters(struct ocgeoTableOptions *table_options);
+static Counters * GetCounters(ocgeoTableOptions *table_options);
 
 static void
 ocgeoGetOptions(Oid foreigntableid, ocgeoTableOptions *table_options)
@@ -350,10 +327,6 @@ ocgeoGetOptions(Oid foreigntableid, ocgeoTableOptions *table_options)
     UserMapping *mapping;
     List       *options;
     ListCell   *lc;
-
-#ifdef DEBUG
-    elog(NOTICE, "ocgeoGetOptions");
-#endif
 
     table = GetForeignTable(foreigntableid);
     server = GetForeignServer(table->serverid);
@@ -409,43 +382,40 @@ ocgeoGetQual(Node *node, TupleDesc tupdesc, char **key, char **value, bool *push
     {
         OpExpr     *op = (OpExpr *) node;
         Node       *left,
-        *right;
+                   *right;
         Index       varattno;
 
         if (list_length(op->args) != 2)
             return;
 
         left = list_nth(op->args, 0);
+        right = list_nth(op->args, 1);
 
-        if (!IsA(left, Var))
+        if (!(IsA(left, Var) && IsA(right, Const) || IsA(left, Const) && IsA(right, Var)))
             return;
+        if (IsA(left, Const)) {
+            Node* t = left;
+            left = right;
+            right = t;
+        }
+
 
         varattno = ((Var *) left)->varattno;
 
-        right = list_nth(op->args, 1);
+        StringInfoData buf;
+        initStringInfo(&buf);
 
-        if (IsA(right, Const))
-        {
-            StringInfoData buf;
+        /* And get the column and value... */
+        *key = NameStr(TupleDescAttr(tupdesc, varattno - 1)->attname);
+        *value = TextDatumGetCString(((Const *) right)->constvalue);
 
-            initStringInfo(&buf);
-
-            /* And get the column and value... */
-            *key = NameStr(TupleDescAttr(tupdesc, varattno - 1)->attname);
-            *value = TextDatumGetCString(((Const *) right)->constvalue);
-
-            /*
-             * We can push down this qual if: - The operatory is TEXTEQ - The
-             * qual is on the `query` column
-             */
-            if (op->opfuncid == PROCID_TEXTEQ && strcmp(*key, "query") == 0)
-                *pushdown = true;
-
-            return;
-        }
+        /*
+         * We can push down this qual if: - The operatory is TEXTEQ - The
+         * qual is on the `query` column
+         */
+        if (op->opfuncid == PROCID_TEXTEQ && strcmp(*key, "query") == 0)
+            *pushdown = true;
     }
-
-    return;
 }
 
 
@@ -632,6 +602,75 @@ typedef struct ocgeoFdwPlanState {
 
 } ocgeoFdwPlanState;
 
+
+/*
+ * ColumnList
+ *		Takes in the planner's information about this foreign table.  The
+ *		function then finds all columns needed for query execution, including
+ *		those used in projections, joins, and filter clauses, de-duplicates
+ *		these columns, and returns them in a new list.
+ */
+List *
+ColumnList(RelOptInfo *baserel)
+{
+	List	   *columnList = NIL;
+	List	   *neededColumnList;
+	AttrNumber	columnIndex;
+	AttrNumber	columnCount = baserel->max_attr;
+
+#if PG_VERSION_NUM >= 90600
+	List	   *targetColumnList = baserel->reltarget->exprs;
+#else
+	List	   *targetColumnList = baserel->reltargetlist;
+#endif
+	List	   *restrictInfoList = baserel->baserestrictinfo;
+	ListCell   *restrictInfoCell;
+
+	/* First add the columns used in joins and projections */
+	neededColumnList = list_copy(targetColumnList);
+
+	/* Then walk over all restriction clauses, and pull up any used columns */
+	foreach(restrictInfoCell, restrictInfoList)
+	{
+		RestrictInfo *restrictInfo = (RestrictInfo *) lfirst(restrictInfoCell);
+		Node	   *restrictClause = (Node *) restrictInfo->clause;
+		List	   *clauseColumnList = NIL;
+
+		/* Recursively pull up any columns used in the restriction clause */
+		clauseColumnList = pull_var_clause(restrictClause,
+#if PG_VERSION_NUM < 90600
+										   PVC_RECURSE_AGGREGATES,
+#endif
+										   PVC_RECURSE_PLACEHOLDERS);
+
+		neededColumnList = list_union(neededColumnList, clauseColumnList);
+	}
+
+	/* Walk over all column definitions, and de-duplicate column list */
+	for (columnIndex = 1; columnIndex <= columnCount; columnIndex++)
+	{
+		ListCell   *neededColumnCell;
+		Var		   *column = NULL;
+
+		/* Look for this column in the needed column list */
+		foreach(neededColumnCell, neededColumnList)
+		{
+			Var		   *neededColumn = (Var *) lfirst(neededColumnCell);
+
+			if (neededColumn->varattno == columnIndex)
+			{
+				column = neededColumn;
+				break;
+			}
+		}
+
+		if (column != NULL)
+			columnList = lappend(columnList, column);
+	}
+
+	return columnList;
+}
+
 static void
 ocgeoGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid)
 {
@@ -693,6 +732,7 @@ ocgeoGetForeignPlan(PlannerInfo *root,
     
     elog(DEBUG1,"entering function %s",__func__);
 
+    List* colList = ColumnList(baserel);
 
     /*
      * We have no native ability to evaluate restriction clauses, so we just
@@ -708,18 +748,92 @@ ocgeoGetForeignPlan(PlannerInfo *root,
                             scan_clauses,
                             scan_relid,
                             NIL,    /* no expressions to evaluate */
-                            NIL,    /* no private state either */
+                            colList, /* private state: the column list */
                             NIL,    /* no custom tlist */
                             NIL,    /* no remote quals */
                             outer_plan);
 }
 
+/*
+ * ColumnMapping reprents a hash table entry that maps a column name to column
+ * related information.  We construct these hash table entries to speed up the
+ * conversion from JSON documents to PostgreSQL tuples; and each hash entry
+ * maps the column name to the column's tuple index and its type-related
+ * information.
+ */
+typedef struct ColumnMapping
+{
+	char		columnName[NAMEDATALEN];
+	uint32		columnIndex;
+	Oid			columnTypeId;
+	int32		columnTypeMod;
+	Oid			columnArrayTypeId;
+} ColumnMapping;
+
+/*
+ * ColumnMappingHash
+ *		Creates a hash table that maps column names to column index and types.
+ *
+ * This table helps us quickly translate OpenCageData JSON data fields to the
+ * corresponding PostgreSQL columns.
+ */
+static HTAB *
+ColumnMappingHash(Oid foreignTableId, List *columnList)
+{
+	ListCell   *columnCell;
+	const long	hashTableSize = 2048;
+	HTAB	   *columnMappingHash;
+
+	/* Create hash table */
+	HASHCTL		hashInfo;
+
+	memset(&hashInfo, 0, sizeof(hashInfo));
+	hashInfo.keysize = NAMEDATALEN;
+	hashInfo.entrysize = sizeof(ColumnMapping);
+	hashInfo.hash = string_hash;
+	hashInfo.hcxt = CurrentMemoryContext;
+
+	columnMappingHash = hash_create("Column Mapping Hash", hashTableSize,
+									&hashInfo,
+									(HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT));
+	Assert(columnMappingHash != NULL);
+
+	foreach(columnCell, columnList)
+	{
+		Var		   *column = (Var *) lfirst(columnCell);
+		AttrNumber	columnId = column->varattno;
+		ColumnMapping *columnMapping;
+		char	   *columnName = NULL;
+		bool		handleFound = false;
+
+#if PG_VERSION_NUM < 110000
+		columnName = get_relid_attribute_name(foreignTableId, columnId);
+#else
+		columnName = get_attname(foreignTableId, columnId, false);
+#endif
+
+		columnMapping = (ColumnMapping *) hash_search(columnMappingHash,
+													  columnName,
+													  HASH_ENTER,
+													  &handleFound);
+		Assert(columnMapping != NULL);
+
+		columnMapping->columnIndex = columnId - 1;
+		columnMapping->columnTypeId = column->vartype;
+		columnMapping->columnTypeMod = column->vartypmod;
+		columnMapping->columnArrayTypeId = get_element_type(column->vartype);
+	}
+
+	return columnMappingHash;
+}
+
 
 typedef struct ocgeoForeignScanState {
     AttInMetadata *attinmeta;
-    CURL  *curl;
     char  *qual_key;
     char  *qual_value;
+    List* columnList;
+    HTAB* columnMappingHash;
     MemoryContext mctxt;
 
     struct ocgeo_api* api;
@@ -739,13 +853,13 @@ ocgeoBeginForeignScan(ForeignScanState *node, int eflags)
     char       *qual_value = NULL;
     bool        pushdown = false;
     ocgeoForeignScanState *sstate;
+    Oid foreignTableId = RelationGetRelid(node->ss.ss_currentRelation);
 
     elog(DEBUG1,"entering function %s",__func__);
 
 
     /* Fetch options  */
-    ocgeoGetOptions(RelationGetRelid(node->ss.ss_currentRelation),
-                    &table_options);
+    ocgeoGetOptions(foreignTableId, &table_options);
 
     /* See if we've got a qual we can push down */
     if (node->ss.ps.plan->qual)
@@ -765,6 +879,10 @@ ocgeoBeginForeignScan(ForeignScanState *node, int eflags)
         }
     }
 
+    List* columnList = (List*) ((ForeignScan*) node->ss.ps.plan)->fdw_private;
+
+	HTAB* columnMappingHash = ColumnMappingHash(foreignTableId, columnList);
+
     /* Stash away the state info we have already */
     sstate = palloc0(sizeof(*sstate));
     node->fdw_state = sstate;
@@ -779,6 +897,9 @@ ocgeoBeginForeignScan(ForeignScanState *node, int eflags)
     sstate->qual_key = qual_key;
     sstate->qual_value = pushdown ? qual_value : NULL;
 
+    sstate->columnList = columnList;
+    sstate->columnMappingHash = columnMappingHash;
+
     /* OK, we connected. If this is an EXPLAIN, bail out now */
     if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
         return;
@@ -790,65 +911,141 @@ ocgeoBeginForeignScan(ForeignScanState *node, int eflags)
     sstate->mctxt = CurrentMemoryContext;
 
     elog(DEBUG1,"function %s, before ocgeo init: api: %s , server : %s",__func__,table_options.api_key, table_options.uri);
-    sstate->api = ocgeo_init(table_options.api_key, table_options.uri, palloc, pfree);
+    sstate->api = ocgeo_init(table_options.api_key, table_options.uri);
     elog(DEBUG1,"function %s, after ocgeo init",__func__);
     sstate->cursor = NULL;
 
-    /* Make a forward request */
-    ocgeo_forward(sstate->api, sstate->qual_value, NULL, &sstate->response);
-    if (ocgeo_response_ok(&sstate->response)) {
-        sstate->cursor = sstate->response.results;
+    /* Make a forward request, only if some restriction is given (pushed-down) */
+    if (sstate->qual_value != NULL) {
+        ocgeo_forward(sstate->api, sstate->qual_value, NULL, &sstate->response);
+        if (ocgeo_response_ok(&sstate->response)) {
+            sstate->cursor = sstate->response.results;
+        }
     }
     
     elog(DEBUG1,"In %s API returned status: %d, results: %d",__func__, sstate->response.status.code, sstate->response.total_results);
 }
 
+
+#if PG_VERSION_NUM < 110000
+#define		GET_RELID_ATTNAME(foreignTableId, columnId) get_relid_attribute_name(foreignTableId, columnId)
+#else
+#define		GET_RELID_ATTNAME(foreignTableId, columnId) get_attname(foreignTableId, columnId, false)
+#endif
+
 TupleTableSlot* ocgeoIterateForeignScan(ForeignScanState * node)
 {
     ocgeoForeignScanState* sstate = node->fdw_state;
-    TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
     ocgeo_result_t* current_result  = sstate->cursor;
 
-    MemoryContext    oldcontext;
-    char      **values;
-    HeapTuple   tuple;
+    Oid foreignTableId = node->ss.ss_currentRelation->rd_node.relNode;
+    TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
+    EState         *estate = node->ss.ps.state;
+    MemoryContext   oldcontext = MemoryContextSwitchTo(estate->es_query_cxt);
 
-    elog(DEBUG1,"entering function %s result: %s",__func__, current_result ? current_result->city : "");
+    TupleDesc	tupleDescriptor = slot->tts_tupleDescriptor;
+	Datum	   *columnValues = slot->tts_values;
+	bool	   *columnNulls = slot->tts_isnull;
+	int32		columnCount = tupleDescriptor->natts;
+
+
+    memset(columnValues, 0, sizeof(Datum) * columnCount);
+    memset(columnNulls, true, sizeof(bool) * columnCount);
+
+    elog(DEBUG1,"entering function %s result: %s attr count=%d, %s",__func__, current_result ? current_result->city : "",
+            columnCount, columnCount>0 ? tupleDescriptor->attrs[0].attname.data : "");
     
+    /*
+	 * We execute the protocol to load a virtual tuple into a slot. We first
+	 * call ExecClearTuple, then fill in values / isnull arrays, and last call
+	 * ExecStoreVirtualTuple.  If we are done iterating over the API results,
+	 * we just return an empty slot as required.
+	 */
     ExecClearTuple(slot);
 
     /* no results or results finished */
     if (current_result == NULL) {
         return slot;
     }
-    sstate->cursor = current_result->next;
-
-
-/* Build the tuple */
-    values = (char **) palloc(sizeof(char *) * 2);
-    values[0] = pstrdup(current_result->city);
-    values[1] = pstrdup(current_result->city);
-
-    tuple = BuildTupleFromCStrings(
-        TupleDescGetAttInMetadata(node->ss.ss_currentRelation->rd_att),
-        values);
-    ExecStoreTuple(tuple, slot, InvalidBuffer, false);
+    sstate->cursor = current_result->next; /* move the cursor to the next result for next iteration */
     
+    /*
+    make_tuple_from_result_row(current_result,
+                               tupleDescriptor, festate->retrieved_attrs,
+                               slot->tts_values, slot->tts_isnull);
+    */
+    ListCell* col;
+    foreach(col, sstate->columnList) {
 
-/*
-    // oldcontext = MemoryContextSwitchTo(node->ss.ps.ps_ExprContext->ecxt_per_query_memory);
+		Var		   *column = (Var *) lfirst(col);
+		AttrNumber	columnId = column->varattno;
+		ColumnMapping *columnMapping;
+		Datum		columnValue;
+		char	   *columnName = NULL;
+		bool		handleFound = false;
 
-    values = palloc(sizeof(*values) * 2);
-    values[0] = pstrdup("reply");
-    values[1] = pstrdup("MANMOS");
+		columnName = GET_RELID_ATTNAME(foreignTableId, columnId);
+		columnMapping = (ColumnMapping *) hash_search(sstate->columnMappingHash,
+													  columnName,
+													  HASH_ENTER,
+													  &handleFound);
+		Assert(columnMapping != NULL);
 
-    tuple = BuildTupleFromCStrings(sstate->attinmeta, values);
-    // MemoryContextSwitchTo(oldcontext);
-    // ExecStoreTuple(tuple, slot, InvalidBuffer, false);
-    ExecStoreTuple(tuple, slot, InvalidBuffer, true);*/
+        elog(DEBUG1,"%s: Column: %s, index=%d, type=%d",__func__, columnName, columnMapping->columnIndex, columnMapping->columnTypeId);
 
+        bool ok = false;
+        if (strcmp(sstate->qual_key, columnName) == 0) {
+            text* result = cstring_to_text(sstate->qual_value);
+            columnValue = PointerGetDatum(result);
+            ok = true;
+        }
+        else if (strcmp("_raw_json", columnName) == 0) {
+            char* js = cJSON_PrintUnformatted(current_result->internal);
+            text* result = cstring_to_text(js);
+            free(js);
+            columnValue = PointerGetDatum(result);
+            ok = true;
+
+            /*
+            result = cstring_to_text_with_len(buffer->data, buffer->len);
+				lex = makeJsonLexContext(result, false);
+				pg_parse_json(lex, &nullSemAction);
+				columnValue = PointerGetDatum(result);
+            */
+        }
+        else {
+            StringInfoData field;
+            initStringInfo(&field);
+            if (strcmp(columnName, "confidence") == 0 || strcmp(columnName, "formatted") == 0) 
+                appendStringInfoString(&field, columnName);
+            else
+                /* By default we look into the components field for fields 
+                 * matching the goven columnName 
+                 */
+                appendStringInfo(&field, "components.%s", columnName);
+
+            if (columnMapping->columnTypeId == TEXTOID || columnMapping->columnTypeId == VARCHAROID) {
+                const char* v = ocgeo_response_get_str(current_result, field.data, &ok);
+                if (ok) {
+                    text* result = cstring_to_text(v);
+                    columnValue = PointerGetDatum(result);
+                }
+            }
+            else if (columnMapping->columnTypeId == INT4OID  || columnMapping->columnTypeId == INT8OID) {
+                int v = ocgeo_response_get_int(current_result, field.data, &ok);
+                if (ok)
+                    columnValue = Int32GetDatum(v);
+            }
+            pfree(field.data);
+        }
+        if (ok) {
+            slot->tts_values[columnMapping->columnIndex] = columnValue;
+            slot->tts_isnull[columnMapping->columnIndex] = false;
+        }
+
+    }
+    ExecStoreVirtualTuple(slot);
     elog(DEBUG1,"exiting function %s slot: %s",__func__, slot ? "OK" : "NULL");
-
     return slot;
 }
 
@@ -868,3 +1065,34 @@ ocgeoEndForeignScan(ForeignScanState *node)
     ocgeo_close(sstate->api);
 }
 
+
+/*
+static void
+make_tuple_from_result(ocgeo_result_t * result,
+                       TupleDesc tupleDescriptor,
+                       List *retrieved_attrs,
+                       Datum *row,
+                       bool *is_null)
+{
+    ListCell   *lc = NULL;
+    int         attid = 0;
+
+    memset(row, 0, sizeof(Datum) * tupleDescriptor->natts);
+    memset(is_null, true, sizeof(bool) * tupleDescriptor->natts);
+
+    foreach(lc, retrieved_attrs)
+    {
+        int         attnum = lfirst_int(lc) - 1;
+        Oid         pgtype = TupleDescAttr(tupleDescriptor, attnum)->atttypid;
+        int32       pgtypmod = TupleDescAttr(tupleDescriptor, attnum)->atttypmod;
+
+        if (sqlite3_column_type(stmt, attid) != SQLITE_NULL)
+        {
+            is_null[attnum] = false;
+            row[attnum] = sqlite_convert_to_pg(pgtype, pgtypmod, stmt, attid);
+            //CStringGetDatum( ?? 
+        }
+        attid++;
+    }
+}
+*/

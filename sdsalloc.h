@@ -40,8 +40,14 @@
 /* Change the memory allocation functions to be the ones provided
  * by the Postgres C API
  */
+#if 0
 #include "postgres.h"
 
 #define s_malloc palloc
 #define s_realloc repalloc
 #define s_free pfree
+#else
+#define s_malloc malloc
+#define s_realloc realloc
+#define s_free free
+#endif

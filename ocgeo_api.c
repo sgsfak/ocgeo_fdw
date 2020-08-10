@@ -20,8 +20,6 @@
   SOFTWARE.
 */
 
-#include "postgres.h"
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <curl/curl.h>
@@ -33,19 +31,15 @@
 #include "sds.h"
 #include "ocgeo_api.h"
 
-#ifndef OCG_API_SERVER
-#define OCG_API_SERVER "https://api.opencagedata.com/geocode/v1/json"
-#endif
-
 #ifndef OCGEO_VERSION
 #define OCGEO_VERSION "0.3.1"
 #endif
 
 
-#ifdef NDEBUG
+#ifndef DEBUG
 #define log(...)
 #else
-#define log(...) fprintf (stderr, __VA_ARGS__)
+#define log(...) elog (DEBUG1, __VA_ARGS__)
 #endif
 
 char* ocgeo_version = OCGEO_VERSION;
@@ -53,32 +47,19 @@ char* ocgeo_version = OCGEO_VERSION;
 
 
 struct ocgeo_api {
-    CURL* curl;
-    // void *(*malloc_fn)(size_t sz);
-    // void (*free_fn)(void *ptr);
-    cJSON_Hooks memfns;
     char* api_key;
     char* server;
 };
 
 struct ocgeo_api*
-ocgeo_init(const char* api_key, const char* server, 
-    void *(*malloc_fn)(size_t sz), void (*free_fn)(void *ptr))
+ocgeo_init(const char* api_key, const char* server)
 {
-    elog(DEBUG1,"entering function %s, ocgeo init",__func__);
-    struct ocgeo_api* api = (*malloc_fn) (sizeof(*api));
-    elog(DEBUG1,"in function %s, before curl init",__func__);
-    api->curl = curl_easy_init();
-    elog(DEBUG1,"in function %s, after curl init",__func__);
+    struct ocgeo_api* api = malloc(sizeof(*api));
+
+    api->api_key = sdsnew(api_key);
+    api->server = sdsnew(server);
     
-    api->memfns.malloc_fn = malloc_fn;
-    api->memfns.free_fn = free_fn;
-    api->api_key = (*malloc_fn)(strlen(api_key) + 1);
-    strcpy(api->api_key, api_key);
-    api->server = (*malloc_fn)(strlen(server) + 1);
-    strcpy(api->server, server);
-    
-    cJSON_InitHooks(&api->memfns);
+    // cJSON_InitHooks(&api->memfns);
 
     return api;
 }
@@ -88,9 +69,9 @@ ocgeo_close(struct ocgeo_api* api)
 {
     if (api == NULL)
         return;
-    (*api->memfns.free_fn)(api->server);
-    (*api->memfns.free_fn)(api->api_key);
-    (*api->memfns.free_fn)(api);
+    sdsfree(api->server);
+    sdsfree(api->api_key);
+    free(api);
 }
 
 
@@ -126,7 +107,6 @@ parse_response_json(cJSON* json, ocgeo_response_t* response)
 
     memset(response, 0, sizeof(ocgeo_response_t));
     response->results = NULL;
-    response->internal = json;
 
     obj = cJSON_GetObjectItemCaseSensitive(json, "status");
     assert(obj);
@@ -289,7 +269,7 @@ do_request(CURL* curl, bool is_fwd, const char* q,
 
     struct http_response r; r.data = sdsempty();
     sds user_agent = sdsempty();
-    user_agent = sdscatprintf(user_agent, "c-ocgeo/%s (%s)", ocgeo_version, curl_version());
+    user_agent = sdscatprintf(user_agent, "ocgeo_fdw/%s (%s)", ocgeo_version, curl_version());
     curl_easy_setopt(curl, CURLOPT_URL, url);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, user_agent);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
@@ -326,39 +306,120 @@ ocgeo_response_t*
 ocgeo_forward(struct ocgeo_api* api, const char* q,
         ocgeo_params_t* params, ocgeo_response_t* response)
 {
-    return do_request(api->curl, true, q, api->api_key, api->server, params, response);
+    CURL* curl = curl_easy_init();
+    return do_request(curl, true, q, api->api_key, api->server, params, response);
 }
 
 ocgeo_response_t*
 ocgeo_reverse(struct ocgeo_api* api, double lat, double lng, 
         ocgeo_params_t* params, ocgeo_response_t* response)
 {
+    CURL* curl = curl_easy_init();
     sds q = sdsempty();
     q = sdscatprintf(q, "%.8F,%.8F", lat, lng);
-    ocgeo_response_t* r = do_request(api->curl, false, q, api->api_key, api->server, params, response);
+    ocgeo_response_t* r = do_request(curl, false, q, api->api_key, api->server, params, response);
     sdsfree(q);
     return r;
 }
 
 
-#define foreach_ocgeo_result(result,response) for(result=(response)->results;result!=NULL;result=result->next)
+#define foreach_ocgeo_result(result,response) 
 
 void ocgeo_response_cleanup(struct ocgeo_api* api, ocgeo_response_t* r)
 {
     if (r == NULL)
         return;
 
-    ocgeo_result_t* result;
-    foreach_ocgeo_result(result, r) {
-        api->memfns.free_fn(result->bounds);
-        api->memfns.free_fn(result->timezone);
-        api->memfns.free_fn(result->roadinfo);
-        api->memfns.free_fn(result->currency);
+    for(ocgeo_result_t* result=r->results; result!=NULL; result=result->next){
+        free(result->bounds);
+        free(result->timezone);
+        free(result->roadinfo);
+        free(result->currency);
     }
     r->total_results = 0;
-    api->memfns.free_fn(r->results);
+    free(r->results);
     r->results = NULL;
-    cJSON_Delete(r->internal);
-    r->internal = NULL;
 }
 
+static
+int str_to_maybe_int(sds s)
+{
+    int k = 0;
+    int len = sdslen(s);
+    for (int i=0; i<len; ++i) {
+        char c = s[i];
+        k += 10*k;
+        switch(c) {
+        case '0': break;
+        case '1': k += 1; break;
+        case '2': k += 2; break;
+        case '3': k += 3; break;
+        case '4': k += 4; break;
+        case '5': k += 5; break;
+        case '6': k += 6; break;
+        case '7': k += 7; break;
+        case '8': k += 8; break;
+        case '9': k += 9; break;
+        default:
+            return -1;
+        }
+    }
+    return k;
+}
+
+static
+cJSON* get_json_field(cJSON* parent, const char* path)
+{
+    static const char* sep = ".";
+
+    if (parent == NULL)
+        return NULL;
+    int n = 0;
+    sds* fields = sdssplitlen(path, strlen(path), sep, 1, &n);
+    if (fields == NULL)
+        return NULL;
+
+    cJSON* current = parent;
+    for (int k = 0; k<n && current != NULL; ++k) {
+        int index = str_to_maybe_int(fields[k]);
+        if (index >= 0)
+            current = cJSON_GetArrayItem(current, index);
+        else
+            current = cJSON_GetObjectItemCaseSensitive(current, fields[k]);
+    }
+    sdsfreesplitres(fields, n);
+    return current;
+}
+
+const char* ocgeo_response_get_str(ocgeo_result_t* r, const char* path, bool* ok)
+{
+    cJSON* js = get_json_field(r->internal, path);
+    if (js == NULL || cJSON_IsNull(js) || !cJSON_IsString(js)) {
+        *ok = false;
+        return NULL;
+    }
+    *ok = true;
+    return js->valuestring;
+}
+
+int ocgeo_response_get_int(ocgeo_result_t* r, const char* path, bool* ok)
+{
+    cJSON* js = get_json_field(r->internal, path);
+    if (js == NULL || cJSON_IsNull(js) || !cJSON_IsNumber(js)) {
+        *ok = false;
+        return 0;
+    }
+    *ok = true;
+    return js->valueint;
+}
+
+double ocgeo_response_get_dbl(ocgeo_result_t* r, const char* path, bool* ok)
+{
+    cJSON* js = get_json_field(r->internal, path);
+    if (js == NULL || cJSON_IsNull(js) || !cJSON_IsNumber(js)) {
+        *ok = false;
+        return 0.0;
+    }
+    *ok = true;
+    return js->valuedouble;
+}

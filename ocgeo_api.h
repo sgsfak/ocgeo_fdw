@@ -17,6 +17,7 @@
 #define OCGEO_CODE_MANY_REQUESTS (429)	/* Too many requests (too quickly, rate limiting) */
 #define OCGEO_CODE_INTERNAL_ERROR (503)	/* Internal server error  */
 
+struct cJSON;
 typedef struct ocgeo_status {
 	int code;
 	char* message;
@@ -119,7 +120,7 @@ typedef struct ocgeo_result {
 	char* what3words;
 
 	struct ocgeo_result* next;
-	void* internal;
+	struct cJSON* internal;
 } ocgeo_result_t;
 
 typedef struct ocgeo_response {
@@ -134,7 +135,7 @@ typedef struct ocgeo_response {
 	int total_results;
 	ocgeo_result_t* results;
 
-	void* internal;
+	struct cJSON* internal;
 } ocgeo_response_t;
 
 typedef struct ocgeo_params {
@@ -188,8 +189,7 @@ typedef struct ocgeo_params {
 struct ocgeo_api;
 
 struct ocgeo_api*
-ocgeo_init(const char* api_key, const char* server, 
-	void *(*malloc_fn)(size_t sz), void (*free_fn)(void *ptr));
+ocgeo_init(const char* api_key, const char* server);
 
 void
 ocgeo_close(struct ocgeo_api* api);
@@ -236,5 +236,32 @@ bool ocgeo_is_valid_latlng(ocgeo_latlng_t coords)
 		-180.0 <=coords.lng && coords.lng <= 180.0;
 }
 
+/*
+ * "Advanced" JSON traversing API!
+ * This is useful for accessing the fields of the returned JSON document
+ * in a generic way, since many of the fields may be missing or new fields
+ * may be added in the future.
+ *
+ * The caller provides a "path" string that contains a series of fields
+ * separated by dots ('.') to access any internal field value. Positive
+ * integer path segments are interpreted as indices in JSON arrays.
+ *
+ * Examples of paths:
+ *  - "annotations.DMS.lat": get the "lat" value, in the "DMS" field of
+ *               the "annotation" field in response
+ *  - "annotations.currency.alternate_symbols.1": get the value at index 1 (2nd elem)
+ *                in the "alternate_symbols" field (which is a JSON array) of the
+ *                "currency" annotation
+ */
+/* Return as string value. The caller should not alter the string, or free the returned
+   pointer, as it points to internally managed memory. If successful (i.e. the field
+   exists and has no 'null' value), `ok` will set to true */
+const char* ocgeo_response_get_str(ocgeo_result_t* r, const char* path, bool* ok);
+/* Return as int value. If successful (i.e. the field exists and has no 'null' value),
+  `ok` will set to true */
+int ocgeo_response_get_int(ocgeo_result_t* r, const char* path, bool* ok);
+/* Return as double value. If successful (i.e. the field exists and has no 'null' value),
+  `ok` will set to true */
+double ocgeo_response_get_dbl(ocgeo_result_t* r, const char* path, bool* ok);
 #endif
 
