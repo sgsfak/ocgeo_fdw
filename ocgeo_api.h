@@ -30,13 +30,13 @@ typedef struct ocgeo_rate_info {
 } ocgeo_rate_info_t;
 
 /*
- * A point using the geographic coordinate reference system, using the World 
+ * A point using the geographic coordinate reference system, using the World
  * Geodetic System 1984 (WGS 84), with longitude and latitude units of decimal
  * degrees
  */
 typedef struct ocgeo_latlng {
-	double lat;
-	double lng;
+       double lat;
+       double lng;
 } ocgeo_latlng_t;
 
 /*
@@ -44,33 +44,9 @@ typedef struct ocgeo_latlng {
  * and NorthEast (max longitude, max latitude) points
  */
 typedef struct ocgeo_latlng_bounds {
-	ocgeo_latlng_t northeast;
-	ocgeo_latlng_t southwest;
+       ocgeo_latlng_t northeast;
+       ocgeo_latlng_t southwest;
 } ocgeo_latlng_bounds_t;
-
-typedef struct {
-	char* name;
-	char* short_name;
-	char* offset_string;
-	int offset_sec;
-	bool now_in_dst;
-} ocgeo_ann_timezone_t;
-
-typedef struct {
-	char* drive_on;
-	char* speed_in;
-	char* road;
-	char* road_type;
-	char* surface;
-} ocgeo_ann_roadinfo_t;
-
-typedef struct {
-	char* name;
-	char* iso_code;
-	char* symbol;
-	char* decimal_mark;
-	char* thousands_separator;
-} ocgeo_ann_currency_t;
 
 typedef struct ocgeo_result {
 
@@ -80,44 +56,7 @@ typedef struct ocgeo_result {
 	/* "geomentry" info */
 	ocgeo_latlng_t geometry;
 
-	/* "components": */
-	char* ISO_alpha2;
-	char* ISO_alpha3;
-	char* type;
-	/* The category of the "match", for the possible values see:
-	   https://github.com/OpenCageData/opencagedata-misc-docs/blob/master/category_values.md */
-	char* category;
-	char* city;
-	char* city_district;
-	char* continent;
-	char* country;
-	char* country_code;
-	char* county;
-	char* house_number;
-	char* neighbourhood;
-	char* political_union;
-	char* postcode;
-	char* road;
-	char* state;
-	char* state_district;
-	char* suburb;
-
 	int confidence;
-
-	/* 
-	 * Annotations, each may be NULL:
-	 */
-
-	int callingcode;
-
-	/* timezone annotation */
-	ocgeo_ann_timezone_t* timezone;
-	/* roadinfo annotation */
-	ocgeo_ann_roadinfo_t* roadinfo;
-	/* currency info */
-	ocgeo_ann_currency_t* currency;
-	char* geohash;
-	char* what3words;
 
 	struct ocgeo_result* next;
 	struct cJSON* internal;
@@ -134,8 +73,6 @@ typedef struct ocgeo_response {
 
 	int total_results;
 	ocgeo_result_t* results;
-
-	struct cJSON* internal;
 } ocgeo_response_t;
 
 typedef struct ocgeo_params {
@@ -223,21 +160,8 @@ bool ocgeo_response_ok(ocgeo_response_t* response)
     return response->status.code == OCGEO_CODE_OK;
 }
 
-
 /*
- * Return true if the given coordinates are "valid":
- *  - Latitude should be between -90.0 and 90.0.
- *  - Longitude should be between -180.0 and 180.0.
-*/
-static inline
-bool ocgeo_is_valid_latlng(ocgeo_latlng_t coords)
-{
-	return -90.0 <=coords.lat && coords.lat <= 90.0 &&
-		-180.0 <=coords.lng && coords.lng <= 180.0;
-}
-
-/*
- * "Advanced" JSON traversing API!
+ * JSON traversing API!
  * This is useful for accessing the fields of the returned JSON document
  * in a generic way, since many of the fields may be missing or new fields
  * may be added in the future.

@@ -160,72 +160,20 @@ parse_response_json(cJSON* json, ocgeo_response_t* response)
             parse_latlng(geom_js, &result->geometry);
         else
             result->geometry = ocgeo_invalid_point;
-        
-
-        cJSON* comp_js = cJSON_GetObjectItemCaseSensitive(result_js, "components");
-        assert(comp_js);
-        result->ISO_alpha2 = JSON_OBJ_GET_STR(comp_js, "ISO_3166-1_alpha-2");
-        result->ISO_alpha3 = JSON_OBJ_GET_STR(comp_js, "ISO_3166-1_alpha-3");
-        result->type = JSON_OBJ_GET_STR(comp_js, "_type");
-        result->category = JSON_OBJ_GET_STR(comp_js, "_category");
-        result->city = JSON_OBJ_GET_STR(comp_js, "city");
-        result->city_district = JSON_OBJ_GET_STR(comp_js, "city_district");
-        result->continent = JSON_OBJ_GET_STR(comp_js, "continent");
-        result->country = JSON_OBJ_GET_STR(comp_js, "country");
-        result->country_code = JSON_OBJ_GET_STR(comp_js, "country_code");
-        result->county = JSON_OBJ_GET_STR(comp_js, "county");
-        result->house_number = JSON_OBJ_GET_STR(comp_js, "house_number");
-        result->neighbourhood = JSON_OBJ_GET_STR(comp_js, "neighbourhood");
-        result->political_union = JSON_OBJ_GET_STR(comp_js, "political_union");
-        result->postcode = JSON_OBJ_GET_STR(comp_js, "postcode");
-        result->road = JSON_OBJ_GET_STR(comp_js, "road");
-        result->state = JSON_OBJ_GET_STR(comp_js, "state");
-        result->state_district = JSON_OBJ_GET_STR(comp_js, "state_district");
-        result->suburb = JSON_OBJ_GET_STR(comp_js, "suburb");
-
-        /* Parse annotations, if exist */
-        cJSON* ann_js = cJSON_GetObjectItemCaseSensitive(result_js, "annotations");
-        if (ann_js) {
-            result->callingcode = JSON_OBJ_GET_INT(ann_js,"callingcode");
-            
-            cJSON* tm_ann = cJSON_GetObjectItemCaseSensitive(ann_js, "timezone");
-            if (tm_ann) {
-                ocgeo_ann_timezone_t* timezone = calloc(1, sizeof(ocgeo_ann_timezone_t));
-                timezone->name = JSON_OBJ_GET_STR(tm_ann, "name");
-                timezone->short_name = JSON_OBJ_GET_STR(tm_ann, "short_name");
-                timezone->offset_string = JSON_OBJ_GET_STR(tm_ann, "offset_string");
-                timezone->offset_sec = JSON_OBJ_GET_INT(tm_ann,"offset_sec");
-                timezone->now_in_dst = JSON_OBJ_GET_INT(tm_ann,"now_in_dst") == 1;
-                result->timezone = timezone;
-            }
-            cJSON* ri_ann = cJSON_GetObjectItemCaseSensitive(ann_js, "roadinfo");
-            if (ri_ann) {
-                ocgeo_ann_roadinfo_t* roadinfo = calloc(1, sizeof(ocgeo_ann_roadinfo_t));
-                roadinfo->drive_on = JSON_OBJ_GET_STR(ri_ann, "drive_on");
-                roadinfo->speed_in = JSON_OBJ_GET_STR(ri_ann, "speed_in");
-                roadinfo->road = JSON_OBJ_GET_STR(ri_ann, "road");
-                roadinfo->road_type = JSON_OBJ_GET_STR(ri_ann, "road_type");
-                roadinfo->surface = JSON_OBJ_GET_STR(ri_ann, "surface");
-                result->roadinfo = roadinfo;
-            }
-            cJSON* cur_ann = cJSON_GetObjectItemCaseSensitive(ann_js, "currency");
-            if (cur_ann) {
-                ocgeo_ann_currency_t* currency = calloc(1, sizeof(ocgeo_ann_currency_t));
-                currency->name = JSON_OBJ_GET_STR(cur_ann, "name");
-                currency->iso_code = JSON_OBJ_GET_STR(cur_ann, "iso_code");
-                currency->symbol = JSON_OBJ_GET_STR(cur_ann, "symbol");
-                currency->decimal_mark = JSON_OBJ_GET_STR(cur_ann, "decimal_mark");
-                currency->thousands_separator = JSON_OBJ_GET_STR(cur_ann, "thousands_separator");
-                result->currency = currency;
-            }
-            result->geohash = JSON_OBJ_GET_STR(ann_js, "geohash");
-            cJSON* w3w_ann = cJSON_GetObjectItemCaseSensitive(ann_js, "what3words");
-            if (w3w_ann) {
-                result->what3words = JSON_OBJ_GET_STR(w3w_ann, "words");
-            }
-        }
     }
     return 0;
+}
+
+/*
+ * Return true if the given coordinates are "valid":
+ *  - Latitude should be between -90.0 and 90.0.
+ *  - Longitude should be between -180.0 and 180.0.
+*/
+static inline
+bool ocgeo_is_valid_latlng(ocgeo_latlng_t coords)
+{
+       return -90.0 <=coords.lat && coords.lat <= 90.0 &&
+               -180.0 <=coords.lng && coords.lng <= 180.0;
 }
 
 static ocgeo_response_t*
@@ -332,9 +280,6 @@ void ocgeo_response_cleanup(struct ocgeo_api* api, ocgeo_response_t* r)
 
     for(ocgeo_result_t* result=r->results; result!=NULL; result=result->next){
         free(result->bounds);
-        free(result->timezone);
-        free(result->roadinfo);
-        free(result->currency);
     }
     r->total_results = 0;
     free(r->results);
