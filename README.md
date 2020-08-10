@@ -11,7 +11,9 @@ CREATE SERVER ocdata_server FOREIGN DATA WRAPPER ocgeo_fdw
 CREATE USER MAPPING FOR current_user SERVER ocdata_server 
         OPTIONS (api_key '6d0e711d72d74daeb2b0bfd2a5cdfdba');
 CREATE FOREIGN TABLE ocgdata_api (
-        _raw_json text,
+        raw_response jsonb,
+        bounding_box box,
+        center point,
         _category text,
         _type text,
         city text,

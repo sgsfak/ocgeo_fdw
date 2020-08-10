@@ -65,6 +65,12 @@
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/jsonb.h"
+#if PG_VERSION_NUM < 130000
+#include "utils/jsonapi.h"
+#else
+#include "utils/jsonfuncs.h"
+#endif
 
 #include "ocgeo_api.h"
 #include "cJSON.h"
@@ -375,47 +381,44 @@ ocgeoGetQual(Node *node, TupleDesc tupdesc, char **key, char **value, bool *push
     *value = NULL;
     *pushdown = false;
 
-    if (!node)
+    if (!node || !IsA(node, OpExpr))
         return;
 
-    if (IsA(node, OpExpr))
-    {
-        OpExpr     *op = (OpExpr *) node;
-        Node       *left,
-                   *right;
-        Index       varattno;
+    OpExpr     *op = (OpExpr *) node;
+    Node       *left,
+               *right;
+    Index       varattno;
 
-        if (list_length(op->args) != 2)
-            return;
+    if (list_length(op->args) != 2)
+        return;
 
-        left = list_nth(op->args, 0);
-        right = list_nth(op->args, 1);
+    left = list_nth(op->args, 0);
+    right = list_nth(op->args, 1);
 
-        if (!(IsA(left, Var) && IsA(right, Const) || IsA(left, Const) && IsA(right, Var)))
-            return;
-        if (IsA(left, Const)) {
-            Node* t = left;
-            left = right;
-            right = t;
-        }
-
-
-        varattno = ((Var *) left)->varattno;
-
-        StringInfoData buf;
-        initStringInfo(&buf);
-
-        /* And get the column and value... */
-        *key = NameStr(TupleDescAttr(tupdesc, varattno - 1)->attname);
-        *value = TextDatumGetCString(((Const *) right)->constvalue);
-
-        /*
-         * We can push down this qual if: - The operatory is TEXTEQ - The
-         * qual is on the `query` column
-         */
-        if (op->opfuncid == PROCID_TEXTEQ && strcmp(*key, "query") == 0)
-            *pushdown = true;
+    if (!((IsA(left, Var) && IsA(right, Const)) || (IsA(left, Const) && IsA(right, Var))))
+        return;
+    if (IsA(left, Const)) {
+        Node* t = left;
+        left = right;
+        right = t;
     }
+
+
+    varattno = ((Var *) left)->varattno;
+
+    StringInfoData buf;
+    initStringInfo(&buf);
+
+    /* And get the column and value... */
+    *key = NameStr(TupleDescAttr(tupdesc, varattno - 1)->attname);
+    *value = TextDatumGetCString(((Const *) right)->constvalue);
+
+    /*
+     * We can push down this qual if: - The operatory is TEXTEQ - The
+     * qual is on the `query` column
+     */
+    if (op->opfuncid == PROCID_TEXTEQ && strcmp(*key, "query") == 0)
+        *pushdown = true;
 }
 
 
@@ -991,27 +994,13 @@ TupleTableSlot* ocgeoIterateForeignScan(ForeignScanState * node)
 													  &handleFound);
 		Assert(columnMapping != NULL);
 
-        elog(DEBUG1,"%s: Column: %s, index=%d, type=%d",__func__, columnName, columnMapping->columnIndex, columnMapping->columnTypeId);
+        // elog(DEBUG1,"%s: Column: %s, index=%d, type=%d",__func__, columnName, columnMapping->columnIndex, columnMapping->columnTypeId);
 
         bool ok = false;
         if (strcmp(sstate->qual_key, columnName) == 0) {
             text* result = cstring_to_text(sstate->qual_value);
             columnValue = PointerGetDatum(result);
             ok = true;
-        }
-        else if (strcmp("_raw_json", columnName) == 0) {
-            char* js = cJSON_PrintUnformatted(current_result->internal);
-            text* result = cstring_to_text(js);
-            free(js);
-            columnValue = PointerGetDatum(result);
-            ok = true;
-
-            /*
-            result = cstring_to_text_with_len(buffer->data, buffer->len);
-				lex = makeJsonLexContext(result, false);
-				pg_parse_json(lex, &nullSemAction);
-				columnValue = PointerGetDatum(result);
-            */
         }
         else {
             StringInfoData field;
@@ -1024,17 +1013,65 @@ TupleTableSlot* ocgeoIterateForeignScan(ForeignScanState * node)
                  */
                 appendStringInfo(&field, "components.%s", columnName);
 
-            if (columnMapping->columnTypeId == TEXTOID || columnMapping->columnTypeId == VARCHAROID) {
+            switch(columnMapping->columnTypeId) {
+            case TEXTOID:
+            case VARCHAROID: {
                 const char* v = ocgeo_response_get_str(current_result, field.data, &ok);
                 if (ok) {
                     text* result = cstring_to_text(v);
                     columnValue = PointerGetDatum(result);
                 }
+                break;
             }
-            else if (columnMapping->columnTypeId == INT4OID  || columnMapping->columnTypeId == INT8OID) {
+            case INT4OID:
+            case INT8OID: {
                 int v = ocgeo_response_get_int(current_result, field.data, &ok);
                 if (ok)
                     columnValue = Int32GetDatum(v);
+                break;
+            }
+            /* Geometric info */
+            case POINTOID: {
+                double lat = ocgeo_response_get_dbl(current_result, "geometry.lat", &ok);
+                if (!ok) break;
+                double lon = ocgeo_response_get_dbl(current_result, "geometry.lng", &ok);
+                if (!ok) break;
+
+                StringInfoData fieldVal;
+                initStringInfo(&fieldVal);
+                appendStringInfo(&fieldVal, "(%.6lf,%.6lf)", lat, lon);
+                columnValue = DirectFunctionCall1(point_in,
+                                                  PointerGetDatum(fieldVal.data));
+                pfree(fieldVal.data);
+                ok = true;
+                break;
+            }
+            case BOXOID: {
+                double lat1 = ocgeo_response_get_dbl(current_result, "bounds.northeast.lat", &ok);
+                if (!ok) break;
+                double lon1 = ocgeo_response_get_dbl(current_result, "bounds.northeast.lng", &ok);
+                if (!ok) break;
+                double lat2 = ocgeo_response_get_dbl(current_result, "bounds.southwest.lat", &ok);
+                if (!ok) break;
+                double lon2 = ocgeo_response_get_dbl(current_result, "bounds.southwest.lng", &ok);
+                if (!ok) break;
+
+                StringInfoData fieldVal;
+                initStringInfo(&fieldVal);
+                appendStringInfo(&fieldVal, "((%.6lf,%.6lf),(%.6lf,%.6lf))", lat1, lon1, lat2, lon2);
+                columnValue = DirectFunctionCall1(box_in, PointerGetDatum(fieldVal.data));
+                pfree(fieldVal.data);
+                ok = true;
+                break;
+            }
+            /* JSONB data type... */
+            case JSONBOID: {
+                char* js = cJSON_PrintUnformatted(current_result->internal);
+                columnValue = DirectFunctionCall1(jsonb_in, PointerGetDatum(js));
+                free(js);
+                ok = true;
+                break;
+            }
             }
             pfree(field.data);
         }
@@ -1064,35 +1101,3 @@ ocgeoEndForeignScan(ForeignScanState *node)
     ocgeoForeignScanState* sstate = node->fdw_state;
     ocgeo_close(sstate->api);
 }
-
-
-/*
-static void
-make_tuple_from_result(ocgeo_result_t * result,
-                       TupleDesc tupleDescriptor,
-                       List *retrieved_attrs,
-                       Datum *row,
-                       bool *is_null)
-{
-    ListCell   *lc = NULL;
-    int         attid = 0;
-
-    memset(row, 0, sizeof(Datum) * tupleDescriptor->natts);
-    memset(is_null, true, sizeof(bool) * tupleDescriptor->natts);
-
-    foreach(lc, retrieved_attrs)
-    {
-        int         attnum = lfirst_int(lc) - 1;
-        Oid         pgtype = TupleDescAttr(tupleDescriptor, attnum)->atttypid;
-        int32       pgtypmod = TupleDescAttr(tupleDescriptor, attnum)->atttypmod;
-
-        if (sqlite3_column_type(stmt, attid) != SQLITE_NULL)
-        {
-            is_null[attnum] = false;
-            row[attnum] = sqlite_convert_to_pg(pgtype, pgtypmod, stmt, attid);
-            //CStringGetDatum( ?? 
-        }
-        attid++;
-    }
-}
-*/
