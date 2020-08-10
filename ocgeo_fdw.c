@@ -61,6 +61,7 @@
 #include "optimizer/restrictinfo.h"
 #include "parser/parsetree.h"
 #include "storage/fd.h"
+#include "storage/ipc.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -243,7 +244,7 @@ ocgeo_fdw_validator (PG_FUNCTION_ARGS)
 static void
 exitHook (int code, Datum arg)
 {
-  /* Cleanup? */
+    curl_global_cleanup();
 }
 
 /*
@@ -256,7 +257,7 @@ void _PG_init (void)
     elog(DEBUG1,"function %s, before curl global init",__func__);
 
     // register an exit hook 
-    // on_proc_exit (&exitHook, PointerGetDatum (NULL));
+    on_proc_exit (&exitHook, PointerGetDatum (NULL));
 
     curl_global_init(CURL_GLOBAL_ALL);
     elog(DEBUG1,"function %s, after curl global init",__func__);
@@ -317,12 +318,13 @@ typedef struct ocgeoTableOptions
  */
 static HTAB *ocgeo_hash = NULL;
 
+static List * ColumnList(RelOptInfo *baserel);
+
 /*
  * Helper functions
  */
 static void ocgeoGetOptions(Oid foreigntableid, ocgeoTableOptions *options);
-static void ocgeoGetQual(Node *node, TupleDesc tupdesc, char **key,
-    char **value, bool *pushdown);
+static Datum ocgeoGetQual(Node *node, TupleDesc tupdesc, char **key, bool *pushdown);
 static Counters * GetCounters(ocgeoTableOptions *table_options);
 
 static void
@@ -374,34 +376,29 @@ ocgeoGetOptions(Oid foreigntableid, ocgeoTableOptions *table_options)
 }
 
 #define PROCID_TEXTEQ 67
-static void
-ocgeoGetQual(Node *node, TupleDesc tupdesc, char **key, char **value, bool *pushdown)
+static Datum
+ocgeoGetQual(Node *node, TupleDesc tupdesc, char **key, bool *pushdown)
 {
     *key = NULL;
-    *value = NULL;
     *pushdown = false;
 
     if (!node || !IsA(node, OpExpr))
-        return;
+        return (Datum)NULL;
 
     OpExpr     *op = (OpExpr *) node;
+    char*   operatorName = get_opname(op->opno);
     Node       *left,
                *right;
     Index       varattno;
 
     if (list_length(op->args) != 2)
-        return;
+        return (Datum)NULL;
 
     left = list_nth(op->args, 0);
     right = list_nth(op->args, 1);
 
-    if (!((IsA(left, Var) && IsA(right, Const)) || (IsA(left, Const) && IsA(right, Var))))
-        return;
-    if (IsA(left, Const)) {
-        Node* t = left;
-        left = right;
-        right = t;
-    }
+    if (!(IsA(left, Var) && IsA(right, Const)))
+        return (Datum)NULL;
 
 
     varattno = ((Var *) left)->varattno;
@@ -411,14 +408,17 @@ ocgeoGetQual(Node *node, TupleDesc tupdesc, char **key, char **value, bool *push
 
     /* And get the column and value... */
     *key = NameStr(TupleDescAttr(tupdesc, varattno - 1)->attname);
-    *value = TextDatumGetCString(((Const *) right)->constvalue);
 
     /*
      * We can push down this qual if: - The operatory is TEXTEQ - The
      * qual is on the `query` column
      */
-    if (op->opfuncid == PROCID_TEXTEQ && strcmp(*key, "query") == 0)
+    if ((strcmp(operatorName, "=") == 0 && strcmp(*key, "query") == 0) ||
+            (strcmp(operatorName, ">=") == 0 && strcmp(*key, "confidence") == 0)) {
         *pushdown = true;
+        return ((Const *) right)->constvalue;
+    }
+    return (Datum)NULL;
 }
 
 
@@ -722,6 +722,8 @@ ocgeoGetForeignPaths(PlannerInfo *root,
                                      NIL));     /* no fdw_private data */
 }
 
+static List *ApplicableOpExpressionList(RelOptInfo *baserel);
+
 static ForeignScan *
 ocgeoGetForeignPlan(PlannerInfo *root,
                     RelOptInfo *baserel,
@@ -732,10 +734,13 @@ ocgeoGetForeignPlan(PlannerInfo *root,
                     Plan *outer_plan)
 {
     Index       scan_relid = baserel->relid;
+    List	   *foreignPrivateList;
+	List	   *opExpressionList = NULL;
+	List	   *colList;
     
     elog(DEBUG1,"entering function %s",__func__);
 
-    List* colList = ColumnList(baserel);
+    colList = ColumnList(baserel);
 
     /*
      * We have no native ability to evaluate restriction clauses, so we just
@@ -745,13 +750,19 @@ ocgeoGetForeignPlan(PlannerInfo *root,
      * handled elsewhere).
      */
     scan_clauses = extract_actual_clauses(scan_clauses, false);
+	/* opExpressionList = ApplicableOpExpressionList(foreignrel); */
 
+	/* We don't need to serialize column list as lists are copiable */
+	colList = ColumnList(baserel);
+
+	/* Construct foreign plan with query document and column list */
+	foreignPrivateList = list_make2(colList, opExpressionList);
     /* Create the ForeignScan node */
     return make_foreignscan(tlist,
                             scan_clauses,
                             scan_relid,
                             NIL,    /* no expressions to evaluate */
-                            colList, /* private state: the column list */
+                            foreignPrivateList, /* private state: the column list */
                             NIL,    /* no custom tlist */
                             NIL,    /* no remote quals */
                             outer_plan);
@@ -855,6 +866,7 @@ ocgeoBeginForeignScan(ForeignScanState *node, int eflags)
     char       *qual_key = NULL;
     char       *qual_value = NULL;
     bool        pushdown = false;
+    int min_confidence = 0;
     ocgeoForeignScanState *sstate;
     Oid foreignTableId = RelationGetRelid(node->ss.ss_currentRelation);
 
@@ -874,15 +886,20 @@ ocgeoBeginForeignScan(ForeignScanState *node, int eflags)
             /* Only the first qual can be pushed down */
             Expr  *state = lfirst(lc);
 
-            ocgeoGetQual((Node *) state,
+            Datum v = ocgeoGetQual((Node *) state,
                          node->ss.ss_currentRelation->rd_att,
-                         &qual_key, &qual_value, &pushdown);
-            if (pushdown)
-                break;
+                         &qual_key, &pushdown);
+            if (!pushdown)
+                continue;
+            if (strcmp(qual_key, "query") == 0)
+                qual_value = TextDatumGetCString(v);
+            else if (strcmp(qual_key, "confidence") == 0)
+                min_confidence = DatumGetUInt8(v);
         }
     }
+    elog(DEBUG1,"function %s qual: %s='%s' and confidence>=%d",__func__, qual_key, qual_value, min_confidence);
 
-    List* columnList = (List*) ((ForeignScan*) node->ss.ps.plan)->fdw_private;
+    List* columnList = list_nth((List*) ((ForeignScan*) node->ss.ps.plan)->fdw_private, 0);
 
 	HTAB* columnMappingHash = ColumnMappingHash(foreignTableId, columnList);
 
@@ -920,7 +937,12 @@ ocgeoBeginForeignScan(ForeignScanState *node, int eflags)
 
     /* Make a forward request, only if some restriction is given (pushed-down) */
     if (sstate->qual_value != NULL) {
-        ocgeo_forward(sstate->api, sstate->qual_value, NULL, &sstate->response);
+        Counters* stats = GetCounters(&table_options);
+        ocgeo_params_t params = ocgeo_default_params();
+        if (min_confidence)
+            params.min_confidence = min_confidence;
+        ocgeo_forward(sstate->api, sstate->qual_value, &params, &sstate->response);
+        stats->calls++;
         if (ocgeo_response_ok(&sstate->response)) {
             sstate->cursor = sstate->response.results;
         }
@@ -955,7 +977,7 @@ TupleTableSlot* ocgeoIterateForeignScan(ForeignScanState * node)
     memset(columnValues, 0, sizeof(Datum) * columnCount);
     memset(columnNulls, true, sizeof(bool) * columnCount);
 
-    elog(DEBUG1,"entering function %s result: %s attr count=%d, %s",__func__, current_result ? current_result->city : "",
+    elog(DEBUG1,"entering function %s attr count=%d, %s",__func__, 
             columnCount, columnCount>0 ? tupleDescriptor->attrs[0].attname.data : "");
     
     /*
@@ -978,7 +1000,8 @@ TupleTableSlot* ocgeoIterateForeignScan(ForeignScanState * node)
                                slot->tts_values, slot->tts_isnull);
     */
     ListCell* col;
-    foreach(col, sstate->columnList) {
+    List* columnList = sstate->columnList;
+    foreach(col, columnList) {
 
 		Var		   *column = (Var *) lfirst(col);
 		AttrNumber	columnId = column->varattno;
@@ -1040,8 +1063,7 @@ TupleTableSlot* ocgeoIterateForeignScan(ForeignScanState * node)
                 StringInfoData fieldVal;
                 initStringInfo(&fieldVal);
                 appendStringInfo(&fieldVal, "(%.6lf,%.6lf)", lat, lon);
-                columnValue = DirectFunctionCall1(point_in,
-                                                  PointerGetDatum(fieldVal.data));
+                columnValue = DirectFunctionCall1(point_in, PointerGetDatum(fieldVal.data));
                 pfree(fieldVal.data);
                 ok = true;
                 break;
@@ -1101,3 +1123,84 @@ ocgeoEndForeignScan(ForeignScanState *node)
     ocgeoForeignScanState* sstate = node->fdw_state;
     ocgeo_close(sstate->api);
 }
+
+
+/*
+ * ApplicableOpExpressionList
+ *		Walks over all filter clauses that relate to this foreign table, and
+ *		chooses applicable clauses that we know we can translate into Mongo
+ *		queries.
+ *
+ * Currently, these clauses include comparison expressions
+ * that have a column and a constant as arguments.  For example,
+ * "o_orderdate >= date '1994-01-01' + interval '1' year" is an applicable
+ * expression.
+ */
+#if 0
+List *
+ApplicableOpExpressionList(RelOptInfo *baserel)
+{
+	List	   *opExpressionList = NIL;
+	List	   *restrictInfoList = baserel->baserestrictinfo;
+	ListCell   *restrictInfoCell;
+
+	foreach(restrictInfoCell, restrictInfoList)
+	{
+		RestrictInfo *restrictInfo = (RestrictInfo *) lfirst(restrictInfoCell);
+		Expr	   *expression = restrictInfo->clause;
+		OpExpr	   *opExpression;
+		char	   *operatorName;
+		List	   *argumentList;
+		Var		   *column;
+		Const	   *constant;
+		bool		equalsOperator = false;
+		bool		constantIsArray = false;
+		Param	   *paramNode;
+
+		/* We only support operator expressions */
+		if (!IsA(expression, OpExpr))
+			continue;
+
+		opExpression = (OpExpr *) expression;
+		operatorName = get_opname(opExpression->opno);
+
+
+		/*
+		 * We only support simple binary operators that compare a column
+		 * against a constant.  If the expression is a tree, we don't recurse
+		 * into it.
+		 */
+		argumentList = opExpression->args;
+		column = (Var *) FindArgumentOfType(argumentList, T_Var);
+		constant = (Const *) FindArgumentOfType(argumentList, T_Const);
+		paramNode = (Param *) FindArgumentOfType(argumentList, T_Param);
+
+		/* We only support =, <, >, <=, >=, and <> operators */
+		if (strncmp(operatorName, "=", NAMEDATALEN) == 0)
+			equalsOperator = true;
+
+		if (!equalsOperator && MongoOperatorName(operatorName) == NULL)
+			continue;
+		/*
+		 * We don't push down operators where the constant is an array, since
+		 * conditional operators for arrays in MongoDB aren't properly
+		 * defined.  For example, {similar_products : [ "B0009S4IJW",
+		 * "6301964144" ]} finds results that are equal to the array, but
+		 * {similar_products: {$gte: [ "B0009S4IJW", "6301964144" ]}} returns
+		 * an empty set.
+		 */
+		if (constant != NULL)
+			if (OidIsValid(get_element_type(constant->consttype)))
+				constantIsArray = true;
+
+		if (column != NULL && constant != NULL && !constantIsArray)
+			opExpressionList = lappend(opExpressionList, opExpression);
+
+		if (column != NULL && paramNode != NULL)
+			opExpressionList = lappend(opExpressionList, opExpression);
+	}
+
+	return opExpressionList;
+}
+#endif
+
