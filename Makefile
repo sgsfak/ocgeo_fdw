@@ -1,7 +1,7 @@
 EXTENSION    = ocgeo_fdw
 EXTVERSION   = $(shell grep default_version $(EXTENSION).control | sed -e "s/default_version[[:space:]]*=[[:space:]]*'\([^']*\)'/\1/")
 MODULE_big   = ocgeo_fdw
-OBJS         = ocgeo_fdw.o ocgeo_api.o sds.o cJSON.o
+OBJS         = ocgeo_fdw.o ocgeo_api.o sds.o cJSON.o utils.o
 # RELEASE      = 1.0.0
 
 DATA         = $(wildcard sql/*--*.sql)

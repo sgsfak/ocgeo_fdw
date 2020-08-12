@@ -327,6 +327,15 @@ static void ocgeoGetOptions(Oid foreigntableid, ocgeoTableOptions *options);
 static Datum ocgeoGetQual(Node *node, TupleDesc tupdesc, char **key, bool *pushdown);
 static Counters * GetCounters(ocgeoTableOptions *table_options);
 
+static bool isAttrInRestrictInfo(Index relid, AttrNumber attno, RestrictInfo *restrictinfo);
+static List *clausesInvolvingAttr(Index relid, AttrNumber attnum, EquivalenceClass *eq_class);
+static List * findPaths(PlannerInfo *root, RelOptInfo *baserel, List *possiblePaths, int startupCost);
+
+extern Value* colnameFromVar(Var *var, PlannerInfo *root);
+extern void extractRestrictions(Relids base_relids, Expr *node, List **quals);
+
+static char* colnameFromTupleVar(Var *var, TupleDesc desc);
+
 static void
 ocgeoGetOptions(Oid foreigntableid, ocgeoTableOptions *table_options)
 {
@@ -373,6 +382,13 @@ ocgeoGetOptions(Oid foreigntableid, ocgeoTableOptions *table_options)
 
     if (!table_options->max_reqs_day)
         table_options->max_reqs_day = 1;
+}
+
+char* colnameFromTupleVar(Var* var, TupleDesc tupdesc)
+{
+    Index varattno = var->varattno;
+    char* name = NameStr(TupleDescAttr(tupdesc, varattno - 1)->attname);
+    return name;
 }
 
 #define PROCID_TEXTEQ 67
@@ -608,6 +624,7 @@ typedef struct ocgeoFdwPlanState {
     ForeignTable* table;
     ForeignServer* server;
     Oid user_id;
+    AttInMetadata *attinmeta;
 
     /* baserestrictinfo clauses, broken down into safe and unsafe subsets. */
 	List	   *remote_conds;
@@ -718,12 +735,20 @@ ocgeoGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntablei
     fplanstate->server = GetForeignServer(fplanstate->table->serverid);
     fplanstate->user_id = baserel->userid;
 
+    /* Get attribute descriptions for the foreign table: */
+    Relation rel = RelationIdGetRelation(fplanstate->table->relid);
+    TupleDesc desc = RelationGetDescr(rel);
+    fplanstate->attinmeta = TupleDescGetAttInMetadata(desc);
+    RelationClose(rel);
+
 	/*
 	 * Identify which baserestrictinfo clauses can be sent to the remote
 	 * server and which can't.
 	 */
 	classifyConditions(root, baserel, foreigntableid, baserel->baserestrictinfo,
 					   &fplanstate->remote_conds, &fplanstate->local_conds);
+    elog(DEBUG1, "%s: remote conds: %d, local conds: %d", __func__, list_length(fplanstate->remote_conds),
+            list_length(fplanstate->local_conds));
 
 	fplanstate->attrs_used = NULL;
 	pull_varattnos((Node *) baserel->reltarget->exprs, baserel->relid, &fplanstate->attrs_used);
@@ -767,18 +792,59 @@ ocgeoGetForeignPaths(PlannerInfo *root,
     ocgeoFdwPlanState *planstate = baserel->fdw_private;
 
 
-    /* Create a ForeignPath node and add it as only possible path */
-    ForeignPath* path = 
-             create_foreignscan_path(root, baserel,
-                                     NULL,      /* default pathtarget */
-                                     baserel->rows,
-                                     planstate->startup_cost,
-                                     planstate->total_cost,
-                                     NIL,       /* no pathkeys */
-                                     NULL,      /* no outer rel either */
-                                     NULL,        /* no extra plan */
-                                     NIL);     /* no fdw_private data */
-    add_path(baserel, (Path*) path);
+#if 1
+    /* Try to find parameterized paths */
+    List* possiblePaths = NIL;
+    List* paths = findPaths(root, baserel, possiblePaths, planstate->startup_cost);
+    elog(DEBUG1, "%s: param paths %d", __func__, list_length(paths));
+
+
+    /* if there are parameterized paths (because of joins etc) do not add
+     * a default path, to force a nested loop */
+    if (list_length(planstate->remote_conds) > 0 && list_length(paths) == 0) {
+        /* Add a simple default path */
+        paths = lappend(paths, create_foreignscan_path(root, baserel,
+#if PG_VERSION_NUM >= 90600
+                    NULL,  /* default pathtarget */
+#endif
+                    baserel->rows,
+                    planstate->startup_cost,
+#if PG_VERSION_NUM >= 90600
+                    baserel->rows * baserel->reltarget->width,
+#else
+                    baserel->rows * baserel->width,
+#endif
+                    NIL,		/* no pathkeys */
+                    NULL,
+#if PG_VERSION_NUM >= 90500
+                    NULL,
+#endif
+                    NULL));
+    }
+
+    /* Add each ForeignPath previously found */
+    ListCell* lc;
+	foreach(lc, paths)
+	{
+		ForeignPath *path = (ForeignPath *) lfirst(lc);
+
+		/* Add the path without modification */
+		add_path(baserel, (Path *) path);
+	}
+#else
+        ForeignPath* path = 
+                 create_foreignscan_path(root, baserel,
+                                         NULL,      /* default pathtarget */
+                                         baserel->rows,
+                                         planstate->startup_cost,
+                                         planstate->total_cost,
+                                         NIL,       /* no pathkeys */
+                                         NULL,      /* no outer rel either */
+                                         NULL,        /* no extra plan */
+                                         NIL);     /* no fdw_private data */
+        add_path(baserel, (Path*) path);
+#endif
+    elog(DEBUG1,"exiting function %s",__func__);
 }
 
 
@@ -827,6 +893,14 @@ classifyConditions(PlannerInfo *root,
 
     *remote_conds = NIL;
     *local_conds = NIL;
+    Relids relids = baserel->relids;
+
+    /*
+    if (IS_UPPER_REL(baserel))
+        relids = fpinfo->outerrel->relids;
+    else
+        relids = baserel->relids;
+    */
 
     foreach(lc, input_conds)
     {
@@ -843,7 +917,7 @@ classifyConditions(PlannerInfo *root,
 
         Var* var = linitial_node(Var, opExpr->args);
         char* opName = get_opname(opExpr->opno);
-        if (var->varno != foreignTableId) /* attribute belongs to foreign table ? */
+        if (!bms_is_member(var->varno, relids) /* && var->varlevelsup == 0*/) /* attribute belongs to foreign table ? */
             goto add_local;
 
         /* We can deal with restrictions of the form:
@@ -851,8 +925,8 @@ classifyConditions(PlannerInfo *root,
          * confidence >= <int>
          */
         char* attName = GET_RELID_ATTNAME(foreignTableId, var->varattno);
-        if ((strcmp(opName, "=") == 0 && strcmp(attName, "query")) ||
-            (strcmp(opName, "<=") == 0 && strcmp(attName, "confidence"))) {
+        if ((strcmp(opName, "=") == 0 && strcmp(attName, "query")==0) ||
+            (strcmp(opName, ">=") == 0 && strcmp(attName, "confidence")==0)) {
             *remote_conds = lappend(*remote_conds, ri);
             continue;
         }
@@ -889,7 +963,7 @@ ocgeoGetForeignPlan(PlannerInfo *root,
     /* List       *remote_conds; */
     /* List       *local_conds; */
 
-    elog(DEBUG1,"entering function %s, %d restrictions",__func__, baserel->baserestrictinfo->length);
+    elog(DEBUG1,"entering function %s, %d restrictions",__func__, list_length(baserel->baserestrictinfo));
 
     printRestrictInfoList(baserel->baserestrictinfo, foreigntableid);
     colList = ColumnList(baserel);
@@ -903,8 +977,29 @@ ocgeoGetForeignPlan(PlannerInfo *root,
      * will be handled elsewhere).
      */
     scan_clauses = extract_actual_clauses(scan_clauses, false);
+    elog(DEBUG1,"%s, %d column list, %d scan clauses",__func__, list_length(colList), list_length(scan_clauses));
 
-	colList = ColumnList(baserel);
+    /* Extract the quals coming from a parameterized path, if any */
+	if (best_path->path.param_info)
+	{
+
+        List* qual_list = NIL;
+        ListCell* lc;
+		foreach(lc, scan_clauses)
+		{
+			extractRestrictions(baserel->relids, (Expr *) lfirst(lc), &qual_list);
+		}
+		foreach(lc, qual_list) {
+            List* clause = lfirst_node(List, lc);
+            Assert(list_length(clause)==3);
+            Var* var = linitial_node(Var, clause);
+            char* op = (char*) lsecond(clause);
+            Expr* val = lthird_node(Expr, clause);
+            elog(DEBUG1, "%s, param restr: %s %s %d", __func__, strVal(colnameFromVar(var, root)), op, nodeTag(val));
+        }
+
+	}
+
     // classifyConditions(root, baserel, foreigntableid, baserel->baserestrictinfo, &remote_conds, &local_conds);
 
 	/* Construct foreign plan with query document and column list */
@@ -913,11 +1008,12 @@ ocgeoGetForeignPlan(PlannerInfo *root,
     return make_foreignscan(tlist,
                             scan_clauses,
                             scan_relid,
-                            NIL,    /* no expressions to evaluate */
+                            scan_clauses,    /* no expressions to evaluate */
                             foreignPrivateList, /* private state: the column list */
                             NIL,    /* no custom tlist */
-                            planstate->remote_conds,    /* remote quals */
+                            NIL,
                             outer_plan);
+    elog(DEBUG1,"exiting function %s",__func__);
 }
 
 /*
@@ -1004,6 +1100,24 @@ typedef struct ocgeoForeignScanState {
 
 } ocgeoForeignScanState;
 
+void pp(char* s, StringInfo d);
+
+void pp(char* s, StringInfo d)
+{
+    initStringInfo(d);
+    if (!s)
+        return;
+    for(int i=0; i<100; ++i) {
+        char c = s[i];
+        if (!c)
+            break;
+
+        if (isprint(c))
+            appendStringInfo(d, "%c", c);
+        else
+            appendStringInfo(d, "[%d]", (int) c);
+    }
+}
 /*
  * ocgeoBeginForeignScan :     Initiate access to the API
  * Begin executing a foreign scan. This is called during executor startup.
@@ -1023,7 +1137,7 @@ typedef struct ocgeoForeignScanState {
  * ExplainForeignScan and EndForeignScan.
  *
  */
-    static void
+static void
 ocgeoBeginForeignScan(ForeignScanState *node, int eflags)
 {
     ocgeoTableOptions table_options;
@@ -1033,7 +1147,6 @@ ocgeoBeginForeignScan(ForeignScanState *node, int eflags)
     int min_confidence = 0;
     ocgeoForeignScanState *sstate;
     Oid foreignTableId = RelationGetRelid(node->ss.ss_currentRelation);
-
     elog(DEBUG1,"entering function %s",__func__);
 
 
@@ -1043,9 +1156,107 @@ ocgeoBeginForeignScan(ForeignScanState *node, int eflags)
     ForeignScan* foreignScan = (ForeignScan *) node->ss.ps.plan;
     List* foreignPrivateList = (List*) foreignScan->fdw_private;
     Assert(list_length(foreignPrivateList) == 2);
-    List* columnList = list_nth(foreignPrivateList, 0);
-    /* List* remoteConds = list_nth(foreignPrivateList, 1); */
 
+    List* columnList = list_nth(foreignPrivateList, 0);
+
+	HTAB* columnMappingHash = ColumnMappingHash(foreignTableId, columnList);
+
+    /* Stash away the state info we have already */
+    sstate = palloc0(sizeof(*sstate));
+    node->fdw_state = sstate;
+
+    /* Store the additional state info */
+    sstate->attinmeta = TupleDescGetAttInMetadata(node->ss.ss_currentRelation->rd_att);
+    sstate->api = NULL;
+    sstate->columnList = columnList;
+    sstate->columnMappingHash = columnMappingHash;
+    sstate->cursor = NULL;
+    sstate->api = NULL;
+
+    List* qual_list = NULL;
+    ListCell* lc;
+    foreach(lc, foreignScan->fdw_exprs) {
+        extractRestrictions(bms_make_singleton(foreignScan->scan.scanrelid),
+                            lfirst_node(Expr, lc), &qual_list);
+    }
+    foreach(lc, qual_list) {
+        ExprContext *econtext = node->ss.ps.ps_ExprContext;
+        List* clause = lfirst_node(List, lc);
+        Assert(list_length(clause)==3);
+
+        Var* var = linitial_node(Var, clause);
+        char* op = (char*) lsecond(clause);
+        Expr* expr = lthird_node(Expr, clause);
+
+        char* attName = colnameFromTupleVar(var, sstate->attinmeta->tupdesc);
+        Datum value;
+        bool isNull = false;
+        StringInfoData qs;
+        initStringInfo(&qs);
+        Oid valueType;
+        ExprState  * expr_state = NULL;
+        switch(nodeTag(expr)) {
+            case T_Param:
+                {
+                    expr_state = ExecInitExpr(expr, (PlanState *) node);
+
+#if PG_VERSION_NUM >= 100000
+                    value = ExecEvalExpr(expr_state, econtext, &isNull);
+#else
+                    value = ExecEvalExpr(expr_state, econtext, &isNull, NULL);
+#endif
+                    appendStringInfo(&qs, "'(%d) PTR %" PRIxPTR " / %d", nodeTag(expr),
+                            value, expr_state->flags);
+                            /* VARATT_IS_COMPRESSED((void*)value)); */
+
+                    valueType = ((Param*) expr)->paramtype;
+
+                    break;
+                }
+            case T_Const:
+                {
+                    isNull = ((Const*) expr)->constisnull;
+                    value = ((Const*) expr)-> constvalue;
+                    valueType = ((Const*) expr)->consttype;
+                    if (valueType == INT2OID || valueType == INT4OID || valueType == INT8OID)
+                        appendStringInfo(&qs, "%d %" PRIxPTR, DatumGetInt32(value), value);
+                    else
+                        appendStringInfo(&qs, "%s %" PRIxPTR, TextDatumGetCString(value), VARSIZE_ANY(value));
+                    break;
+                }
+            default:
+                break;
+        }
+        if (isNull)
+            continue;
+        if (strcmp(attName, "query")==0 && strcmp(op, "=")==0) {
+            qual_key = pstrdup("query");
+            char *temp= (char*) (value);
+            StringInfoData d;
+            pp(temp, &d);
+            elog(DEBUG1, "before valena: %d '%s'", 13, d.data);
+            /* qual_value = TextDatumGetCString(value); */
+            qual_value = pstrdup("athens, greece");
+            /* qual_value = pstrdup(temp); */
+            elog(DEBUG1, "valena: %d '%s'", valueType, qual_value);
+            pushdown = true;
+        }
+        else if (strcmp(attName, "confidence")==0 && strcmp(op, ">=")==0) {
+            min_confidence = DatumGetInt32(value);
+        }
+
+		ColumnMapping *columnMapping;
+		bool		handleFound = false;
+
+		columnMapping = (ColumnMapping *) hash_search(sstate->columnMappingHash,
+                attName,
+													  HASH_ENTER,
+													  &handleFound);
+        elog(DEBUG1, "%s, param restr: %s (type:%d / valtype %d) %s %s", __func__, attName, 
+               columnMapping->columnTypeId, valueType, op, qs.data);
+    }
+
+#if 0
     /* See if we've got a qual we can push down */
     if (node->ss.ps.plan->qual)
     {
@@ -1067,25 +1278,14 @@ ocgeoBeginForeignScan(ForeignScanState *node, int eflags)
                 min_confidence = DatumGetUInt8(v);
         }
     }
-    elog(DEBUG1,"function %s qual: %s='%s' and confidence>=%d",__func__, qual_key, qual_value, min_confidence);
-
-
-	HTAB* columnMappingHash = ColumnMappingHash(foreignTableId, columnList);
-
-    /* Stash away the state info we have already */
-    sstate = palloc0(sizeof(*sstate));
-    node->fdw_state = sstate;
-
-    /* Store the additional state info */
-    sstate->attinmeta = TupleDescGetAttInMetadata(node->ss.ss_currentRelation->rd_att);
-    sstate->api = NULL;
+#endif
     sstate->qual_key = qual_key;
     sstate->qual_value = pushdown ? qual_value : NULL;
     sstate->min_confidence = min_confidence;
-    sstate->columnList = columnList;
-    sstate->columnMappingHash = columnMappingHash;
-    sstate->cursor = NULL;
-    sstate->api = NULL;
+
+    elog(DEBUG1,"function %s qual: %s='%s' and confidence>=%d",__func__, qual_key, qual_value, min_confidence);
+
+
 
     /* OK, we connected. If this is an EXPLAIN, bail out now */
     if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
@@ -1103,6 +1303,7 @@ ocgeoBeginForeignScan(ForeignScanState *node, int eflags)
     if (sstate->qual_value != NULL) {
         Counters* stats = GetCounters(&table_options);
         ocgeo_params_t params = ocgeo_default_params();
+        params.limit=100;
         if (sstate->min_confidence)
             params.min_confidence = sstate->min_confidence;
         ocgeo_forward(sstate->api, sstate->qual_value, &params, &sstate->response);
@@ -1295,6 +1496,8 @@ static void
 ocgeoReScanForeignScan(ForeignScanState *node)
 {
     elog(DEBUG1,"entering function %s",__func__);
+    ocgeoEndForeignScan(node);
+    ocgeoBeginForeignScan(node, 0);
 }
 
 
@@ -1319,3 +1522,159 @@ void ocgeoExplainForeignScan (ForeignScanState * node, ExplainState * es)
 
     ExplainPropertyText("OpenCageData API query", q->data, es);
 }
+
+
+/*
+ *	Test wheter an attribute identified by its relid and attno
+ *	is present in a list of restrictinfo
+ */
+bool
+isAttrInRestrictInfo(Index relid, AttrNumber attno, RestrictInfo *restrictinfo)
+{
+	List	   *vars = pull_var_clause((Node *) restrictinfo->clause,
+#if PG_VERSION_NUM >= 90600
+										PVC_RECURSE_AGGREGATES|
+										PVC_RECURSE_PLACEHOLDERS);
+#else
+										PVC_RECURSE_AGGREGATES,
+										PVC_RECURSE_PLACEHOLDERS);
+#endif
+	ListCell   *lc;
+
+	foreach(lc, vars)
+	{
+		Var		   *var = (Var *) lfirst(lc);
+
+		if (var->varno == relid && var->varattno == attno)
+		{
+			return true;
+		}
+
+	}
+	return false;
+}
+
+List *
+clausesInvolvingAttr(Index relid, AttrNumber attnum, EquivalenceClass *ec)
+{
+	List	   *clauses = NULL;
+
+	/*
+	 * If there is only one member, then the equivalence class is either for
+	 * an outer join, or a desired sort order. So we better leave it
+	 * untouched.
+	 */
+	if (ec->ec_members->length > 1)
+	{
+		ListCell   *ri_lc;
+
+		foreach(ri_lc, ec->ec_sources)
+		{
+			RestrictInfo *ri = (RestrictInfo *) lfirst(ri_lc);
+
+			if (isAttrInRestrictInfo(relid, attnum, ri))
+			{
+				clauses = lappend(clauses, ri);
+			}
+		}
+	}
+	return clauses;
+}
+
+List *
+findPaths(PlannerInfo *root, RelOptInfo *baserel, List *possiblePaths, int startupCost)
+{
+	List	   *result = NIL;
+    int i;
+    ocgeoFdwPlanState* state = baserel->fdw_private;
+    AttInMetadata* attinmeta = state->attinmeta;
+    AttrNumber	attnum = InvalidAttrNumber;
+    for (i = 0; i < attinmeta->tupdesc->natts; i++)
+    {
+        Form_pg_attribute attr = TupleDescAttr(attinmeta->tupdesc,i);
+
+        if (attr->attisdropped)
+            continue;
+        char* attname = NameStr(attr->attname);
+        if (strcmp(attname, "query") == 0) {
+            attnum = i + 1;
+            break;
+        }
+    }
+    if (attnum == InvalidAttrNumber)
+        return result;
+
+    int			nbrows = 10; // XXX
+    Bitmapset  *outer_relids = NULL;
+
+    /* Armed with this knowledge, look for a join condition */
+    /* matching the path list. */
+    /* Every key must be present in either, a join clause or an */
+    /* equivalence_class. */
+    ListCell   *lc;
+    List	   *clauses = NIL;
+
+    /* Look in the equivalence classes. */
+    foreach(lc, root->eq_classes) {
+        EquivalenceClass *ec = (EquivalenceClass *) lfirst(lc);
+        List	   *ec_clauses = clausesInvolvingAttr(baserel->relid,
+                attnum,
+                ec);
+
+        clauses = list_concat(clauses, ec_clauses);
+        if (ec_clauses != NIL)
+        {
+            outer_relids = bms_union(outer_relids, ec->ec_relids);
+        }
+    }
+    /* Do the same thing for the outer joins */
+    foreach(lc, list_union(root->left_join_clauses, root->right_join_clauses)) {
+        RestrictInfo *ri = (RestrictInfo *) lfirst(lc);
+
+        if (isAttrInRestrictInfo(baserel->relid, attnum, ri)) {
+            clauses = lappend(clauses, ri);
+            outer_relids = bms_union(outer_relids,
+                    ri->outer_relids);
+
+        }
+    }
+    if (clauses == NIL)
+        return result;
+
+    /* Every key has a corresponding restriction, we can build */
+    /* the parameterized path and add it to the plan. */
+    Bitmapset  *req_outer = bms_difference(outer_relids, bms_make_singleton(baserel->relid));
+    ParamPathInfo *ppi;
+    ForeignPath *foreignPath;
+
+    if (!bms_is_empty(req_outer)) {
+        ppi = makeNode(ParamPathInfo);
+        ppi->ppi_req_outer = req_outer;
+        ppi->ppi_rows = nbrows;
+        ppi->ppi_clauses = list_concat(ppi->ppi_clauses, clauses);
+        /* Add a simple parameterized path */
+        foreignPath = create_foreignscan_path(
+                root, baserel,
+#if PG_VERSION_NUM >= 90600
+                NULL,  /* default pathtarget */
+#endif
+                nbrows,
+                startupCost,
+#if PG_VERSION_NUM >= 90600
+                nbrows * baserel->reltarget->width,
+#else
+                nbrows * baserel->width,
+#endif
+                NIL, /* no pathkeys */
+                NULL,
+#if PG_VERSION_NUM >= 90500
+                NULL,
+#endif
+                NULL);
+
+        foreignPath->path.param_info = ppi;
+        result = lappend(result, foreignPath);
+    }
+    return result;
+}
+
