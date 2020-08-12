@@ -1100,24 +1100,6 @@ typedef struct ocgeoForeignScanState {
 
 } ocgeoForeignScanState;
 
-void pp(char* s, StringInfo d);
-
-void pp(char* s, StringInfo d)
-{
-    initStringInfo(d);
-    if (!s)
-        return;
-    for(int i=0; i<100; ++i) {
-        char c = s[i];
-        if (!c)
-            break;
-
-        if (isprint(c))
-            appendStringInfo(d, "%c", c);
-        else
-            appendStringInfo(d, "[%d]", (int) c);
-    }
-}
 /*
  * ocgeoBeginForeignScan :     Initiate access to the API
  * Begin executing a foreign scan. This is called during executor startup.
@@ -1191,8 +1173,6 @@ ocgeoBeginForeignScan(ForeignScanState *node, int eflags)
         char* attName = colnameFromTupleVar(var, sstate->attinmeta->tupdesc);
         Datum value;
         bool isNull = false;
-        StringInfoData qs;
-        initStringInfo(&qs);
         Oid valueType;
         ExprState  * expr_state = NULL;
         switch(nodeTag(expr)) {
@@ -1205,12 +1185,7 @@ ocgeoBeginForeignScan(ForeignScanState *node, int eflags)
 #else
                     value = ExecEvalExpr(expr_state, econtext, &isNull, NULL);
 #endif
-                    appendStringInfo(&qs, "'(%d) PTR %" PRIxPTR " / %d", nodeTag(expr),
-                            value, expr_state->flags);
-                            /* VARATT_IS_COMPRESSED((void*)value)); */
-
                     valueType = ((Param*) expr)->paramtype;
-
                     break;
                 }
             case T_Const:
@@ -1218,27 +1193,16 @@ ocgeoBeginForeignScan(ForeignScanState *node, int eflags)
                     isNull = ((Const*) expr)->constisnull;
                     value = ((Const*) expr)-> constvalue;
                     valueType = ((Const*) expr)->consttype;
-                    if (valueType == INT2OID || valueType == INT4OID || valueType == INT8OID)
-                        appendStringInfo(&qs, "%d %" PRIxPTR, DatumGetInt32(value), value);
-                    else
-                        appendStringInfo(&qs, "%s %" PRIxPTR, TextDatumGetCString(value), VARSIZE_ANY(value));
                     break;
                 }
             default:
                 break;
         }
-        if (isNull)
+        if (isNull || value==0)
             continue;
         if (strcmp(attName, "query")==0 && strcmp(op, "=")==0) {
             qual_key = pstrdup("query");
-            char *temp= (char*) (value);
-            StringInfoData d;
-            pp(temp, &d);
-            elog(DEBUG1, "before valena: %d '%s'", 13, d.data);
-            /* qual_value = TextDatumGetCString(value); */
-            qual_value = pstrdup("athens, greece");
-            /* qual_value = pstrdup(temp); */
-            elog(DEBUG1, "valena: %d '%s'", valueType, qual_value);
+            qual_value = TextDatumGetCString(value);
             pushdown = true;
         }
         else if (strcmp(attName, "confidence")==0 && strcmp(op, ">=")==0) {
@@ -1252,33 +1216,10 @@ ocgeoBeginForeignScan(ForeignScanState *node, int eflags)
                 attName,
 													  HASH_ENTER,
 													  &handleFound);
-        elog(DEBUG1, "%s, param restr: %s (type:%d / valtype %d) %s %s", __func__, attName, 
-               columnMapping->columnTypeId, valueType, op, qs.data);
+        elog(DEBUG1, "%s, param restr: %s (type:%d / valtype %d) %s", __func__, attName, 
+               columnMapping->columnTypeId, valueType, op);
     }
 
-#if 0
-    /* See if we've got a qual we can push down */
-    if (node->ss.ps.plan->qual)
-    {
-        ListCell   *lc;
-
-        foreach(lc, node->ss.ps.plan->qual)
-        {
-            /* Only the first qual can be pushed down */
-            Expr  *state = lfirst(lc);
-
-            Datum v = ocgeoGetQual((Node *) state,
-                         node->ss.ss_currentRelation->rd_att,
-                         &qual_key, &pushdown);
-            if (!pushdown)
-                continue;
-            if (strcmp(qual_key, "query") == 0)
-                qual_value = TextDatumGetCString(v);
-            else if (strcmp(qual_key, "confidence") == 0)
-                min_confidence = DatumGetUInt8(v);
-        }
-    }
-#endif
     sstate->qual_key = qual_key;
     sstate->qual_value = pushdown ? qual_value : NULL;
     sstate->min_confidence = min_confidence;
