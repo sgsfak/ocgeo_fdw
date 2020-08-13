@@ -1173,7 +1173,7 @@ TupleTableSlot* ocgeoIterateForeignScan(ForeignScanState * node)
     ocgeoForeignScanState* sstate = node->fdw_state;
     ocgeo_result_t* current_result  = sstate->cursor;
 
-    Oid foreignTableId = node->ss.ss_currentRelation->rd_node.relNode;
+    Oid foreignTableId = sstate->tableid;
     TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
     elog(DEBUG2, "entering %s Relid: %d", __func__, foreignTableId);
 
