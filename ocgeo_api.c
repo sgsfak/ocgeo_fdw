@@ -105,7 +105,9 @@ parse_response_json(cJSON* json, ocgeo_response_t* response)
 {
     cJSON* obj = NULL;
 
+    sds url = response->url; /* protect the url from memset */
     memset(response, 0, sizeof(ocgeo_response_t));
+    response->url = url;
     response->results = NULL;
 
     obj = cJSON_GetObjectItemCaseSensitive(json, "status");
@@ -176,22 +178,16 @@ bool ocgeo_is_valid_latlng(ocgeo_latlng_t coords)
                -180.0 <=coords.lng && coords.lng <= 180.0;
 }
 
-static ocgeo_response_t*
-do_request(CURL* curl, bool is_fwd, const char* q, 
-           const char* api_key, const char* server,
-           ocgeo_params_t* params, ocgeo_response_t* response)
+static sds
+ocgeo_server_request_uri_impl(const char* api_key, const char* server,
+        const char* query, bool is_fwd, ocgeo_params_t* params);
+
+sds
+ocgeo_server_request_uri_impl(const char* api_key, const char* server,
+        const char* query, bool is_fwd, ocgeo_params_t* params)
 {
-    if (params == NULL) {
-        ocgeo_params_t params = ocgeo_default_params();
-        return do_request(curl, is_fwd, q, api_key, server, &params, response);
-    }
-
-    /* Make sure that we have a proper response: */
-    if (response == NULL)
-        return NULL;
-
     // Build URL:
-    char* q_escaped = curl_easy_escape(curl, q, 0);
+    char* q_escaped = curl_easy_escape(NULL, query, 0);
     sds url = sdsempty();
     url = sdscatprintf(url, "%s?q=%s&key=%s", server, q_escaped, api_key);
     curl_free(q_escaped);
@@ -212,13 +208,38 @@ do_request(CURL* curl, bool is_fwd, const char* q,
         url = sdscat(url, "&roadinfo=1");
     if (is_fwd && ocgeo_is_valid_latlng(params->proximity))
         url = sdscatprintf(url, "&proximity=%.8F,%.8F", params->proximity.lat, params->proximity.lng);
+    return url;
+}
+
+
+static bool
+do_request(CURL* curl, bool is_fwd, const char* q, 
+           const char* api_key, const char* server,
+           ocgeo_params_t* params, ocgeo_response_t* response)
+{
+    if (params == NULL) {
+        ocgeo_params_t params = ocgeo_default_params();
+        return do_request(curl, is_fwd, q, api_key, server, &params, response);
+    }
+
+    /* Make sure that we have a proper response: */
+    if (response == NULL)
+        return false;
+
+    // Build URL:
+    sds url = ocgeo_server_request_uri_impl(api_key, server, q, is_fwd, params);
+    if (response->url) {
+        sdsfree(response->url);
+        response->url = NULL;
+    }
+    response->url = url;
 
     // log("URL=%s\n", url);
 
     struct http_response r; r.data = sdsempty();
     sds user_agent = sdsempty();
     user_agent = sdscatprintf(user_agent, "ocgeo_fdw/%s (%s)", ocgeo_version, curl_version());
-    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_URL, response->url);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, user_agent);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &r);
@@ -228,17 +249,17 @@ do_request(CURL* curl, bool is_fwd, const char* q,
 
     if (res != CURLE_OK) {
         sdsfree(r.data);
-        return NULL;
+        return false;
     }
 
     cJSON* json = cJSON_Parse(r.data);
     sdsfree(r.data);
 
     if (json == NULL)
-        return NULL;
+        return false;
 
     parse_response_json(json, response);
-    return response;
+    return true;
 }
 
 ocgeo_params_t ocgeo_default_params()
@@ -250,7 +271,7 @@ ocgeo_params_t ocgeo_default_params()
 }
 
 
-ocgeo_response_t*
+bool
 ocgeo_forward(struct ocgeo_api* api, const char* q,
         ocgeo_params_t* params, ocgeo_response_t* response)
 {
@@ -258,25 +279,25 @@ ocgeo_forward(struct ocgeo_api* api, const char* q,
     return do_request(curl, true, q, api->api_key, api->server, params, response);
 }
 
-ocgeo_response_t*
+bool
 ocgeo_reverse(struct ocgeo_api* api, double lat, double lng, 
         ocgeo_params_t* params, ocgeo_response_t* response)
 {
     CURL* curl = curl_easy_init();
     sds q = sdsempty();
     q = sdscatprintf(q, "%.8F,%.8F", lat, lng);
-    ocgeo_response_t* r = do_request(curl, false, q, api->api_key, api->server, params, response);
+    bool r = do_request(curl, false, q, api->api_key, api->server, params, response);
     sdsfree(q);
     return r;
 }
 
 
-#define foreach_ocgeo_result(result,response) 
-
 void ocgeo_response_cleanup(struct ocgeo_api* api, ocgeo_response_t* r)
 {
     if (r == NULL)
         return;
+    sdsfree(r->url);
+    r->url = NULL;
 
     for(ocgeo_result_t* result=r->results; result!=NULL; result=result->next){
         free(result->bounds);

@@ -65,6 +65,7 @@ typedef struct ocgeo_result {
 typedef struct ocgeo_response {
 	/* Returned status */
 	ocgeo_status_t status;
+    char* url; /* the actual URL used, based on the given params */
 
 	/* Rate information. If not returned (e.g. for paying customers)
 	   all its fields should be 0.
@@ -139,24 +140,27 @@ ocgeo_close(struct ocgeo_api* api);
 ocgeo_params_t ocgeo_default_params(void);
 
 /* Make a forward request i.e. find information about an address, place etc.
+   Returns false if there was an error contacting the server or parsing the
+   returned JSON reply.
    You can supply NULL as `params` and the default values will be used
 */
-ocgeo_response_t* ocgeo_forward(struct ocgeo_api* api, const char* query, ocgeo_params_t* params, ocgeo_response_t* response);
+bool ocgeo_forward(struct ocgeo_api* api, const char* query, ocgeo_params_t* params, ocgeo_response_t* response);
  
 /* Make a reverse request i.e. find what exists in the given latitude and longtitude.
+   Returns false if there was an error contacting the server or parsing the
+   returned JSON reply.
    You can supply NULL as `params` and the default values will be used
 */
-ocgeo_response_t* ocgeo_reverse(struct ocgeo_api* api, double lat, double lng, ocgeo_params_t* params, ocgeo_response_t* response);
+bool ocgeo_reverse(struct ocgeo_api* api, double lat, double lng, ocgeo_params_t* params, ocgeo_response_t* response);
 
 /* Free the memory used by the response of a forward or reverse call */
 void ocgeo_response_cleanup(struct ocgeo_api* api, ocgeo_response_t* r);
-
 
 static inline
 bool ocgeo_response_ok(ocgeo_response_t* response)
 {
     if (response == NULL)
-        return 0;
+        return false;
     return response->status.code == OCGEO_CODE_OK;
 }
 

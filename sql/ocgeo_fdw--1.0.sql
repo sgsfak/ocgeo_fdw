@@ -12,12 +12,13 @@ LANGUAGE C STRICT;
 COMMENT ON FUNCTION ocgeo_fdw_validator(text[], oid)
 IS 'OpenCageData API foreign data wrapper options validator';
 
--- CREATE FUNCTION ocgeo_stats(name DEFAULT NULL) RETURNS text
--- AS 'MODULE_PATHNAME'
--- LANGUAGE C STABLE CALLED ON NULL INPUT;
+CREATE OR REPLACE FUNCTION ocgeo_stats(OUT nbr_calls bigint, OUT nbr_failed bigint, OUT total_time float8)
+    RETURNS SETOF record
+    AS 'MODULE_PATHNAME', 'ocgeo_stats'
+    LANGUAGE C IMMUTABLE STRICT;
 
--- COMMENT ON FUNCTION ocgeo_stats(name)
--- IS 'shows the information, version of ocgeo_fdw, PostgreSQL, and stats of its usage';
+COMMENT ON FUNCTION ocgeo_stats(name)
+ IS 'shows the stats of usage: number of API calls, number of failed ones, total nbr of seconds';
 
 CREATE FOREIGN DATA WRAPPER ocgeo_fdw
   HANDLER ocgeo_fdw_handler
@@ -25,3 +26,4 @@ CREATE FOREIGN DATA WRAPPER ocgeo_fdw
 
 COMMENT ON FOREIGN DATA WRAPPER ocgeo_fdw
 IS 'OpenCageData API foreign data wrapper';
+

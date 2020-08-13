@@ -89,8 +89,6 @@ struct OCGeoFdwOption
     bool optrequired;
 };
 
-#define DEFAULT_MAX_LONG 32767
-#define DEFAULT_PREFETCH 200
 
 #define URI_OPTION          "uri"
 #define API_KEY_OPTION      "api_key"
@@ -98,6 +96,7 @@ struct OCGeoFdwOption
 #define MAX_REQS_DAY_OPTION "max_reqs_day"
 
 #define QUERY_ATT_NAME      "q"
+#define MAX_RESULTS_REQUESTED 50
 /*
  * Valid options for ocgeo_fdw.
  */
@@ -261,13 +260,13 @@ exitHook (int code, Datum arg)
  */
 void _PG_init (void)
 {
-    elog(DEBUG1,"function %s, before curl global init",__func__);
+    elog(DEBUG2,"function %s, before curl global init",__func__);
 
     // register an exit hook 
     on_proc_exit (&exitHook, PointerGetDatum (NULL));
 
     curl_global_init(CURL_GLOBAL_ALL);
-    elog(DEBUG1,"function %s, after curl global init",__func__);
+    elog(DEBUG2,"function %s, after curl global init",__func__);
 }
 
 
@@ -334,6 +333,113 @@ extern void extractRestrictions(Relids base_relids, Expr *node, List **quals);
 
 static char* colnameFromTupleVar(Var *var, TupleDesc desc);
 
+Datum
+ocgeo_stats(PG_FUNCTION_ARGS)
+{
+    FuncCallContext     *funcctx;
+    int                  call_cntr;
+    int                  max_calls;
+    TupleDesc            tupdesc;
+    AttInMetadata       *attinmeta;
+    HTAB                *ht = ocgeo_hash;
+    HASH_SEQ_STATUS     *hash_seq = NULL;
+
+    /* stuff done only on the first call of the function */
+    if (SRF_IS_FIRSTCALL())
+    {
+        MemoryContext   oldcontext;
+
+        /* create a function context for cross-call persistence */
+        funcctx = SRF_FIRSTCALL_INIT();
+
+        /* switch to memory context appropriate for multiple function calls */
+        oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+        /* total number of tuples to be returned */
+        funcctx->max_calls = ht != NULL ? hash_get_num_entries(ht) : 0;
+
+        /* Build a tuple descriptor for our result type */
+        if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("function returning record called in context "
+                            "that cannot accept type record")));
+
+        /*
+         * generate attribute metadata needed later to produce tuples from raw
+         * C strings
+         */
+        attinmeta = TupleDescGetAttInMetadata(tupdesc);
+        funcctx->attinmeta = attinmeta;
+
+        if (ht != NULL) {
+            hash_seq = palloc0(sizeof(*hash_seq));
+            hash_seq_init(hash_seq, ht);
+            funcctx->user_fctx = hash_seq;
+        }
+
+        MemoryContextSwitchTo(oldcontext);
+    }
+
+    /* stuff done on every call of the function */
+    funcctx = SRF_PERCALL_SETUP();
+
+    call_cntr = funcctx->call_cntr;
+    max_calls = funcctx->max_calls;
+    attinmeta = funcctx->attinmeta;
+    hash_seq  = funcctx->user_fctx;
+
+    ocgeoHashEntry* hentry = hash_seq != NULL ? hash_seq_search(hash_seq) : NULL;
+    if (hentry != NULL)    /* do when there is more left to send */
+    {
+        char      **values;
+        HeapTuple tuple;
+        Datum     result;
+        int64     total_calls;
+        int64     failed_calls;
+        double    total_time_ms;
+        double    total_time;
+
+        total_calls = hentry->counters.calls;
+        failed_calls = total_calls - hentry->counters.success_calls;
+        total_time_ms = hentry->counters.total_time;
+        total_time = total_time_ms / 1000.0;
+        /*
+         * Prepare a values array for building the returned tuple.
+         * This should be an array of C strings which will
+         * be processed later by the type input functions.
+         */
+        values = (char **) palloc(3 * sizeof(char *));
+        values[0] = (char *) palloc(16 * sizeof(char));
+        values[1] = (char *) palloc(16 * sizeof(char));
+        values[2] = (char *) palloc(16 * sizeof(char));
+
+        snprintf(values[0], 16, "%ld", total_calls);
+        snprintf(values[1], 16, "%ld", failed_calls);
+        snprintf(values[2], 16, "%.2lf", total_time);
+
+        /* build a tuple */
+        tuple = BuildTupleFromCStrings(attinmeta, values);
+
+        /* make the tuple into a datum */
+        result = HeapTupleGetDatum(tuple);
+
+        /* clean up (this is not really necessary) */
+        pfree(values[0]);
+        pfree(values[1]);
+        pfree(values[2]);
+        pfree(values);
+
+        SRF_RETURN_NEXT(funcctx, result);
+    }
+    else    /* do when there is no more left */
+    {
+        if (hash_seq != NULL)
+            pfree(hash_seq);
+        SRF_RETURN_DONE(funcctx);
+    }
+}
+
 static void
 ocgeoGetOptions(Oid foreigntableid, ocgeoTableOptions *table_options)
 {
@@ -360,16 +466,16 @@ ocgeoGetOptions(Oid foreigntableid, ocgeoTableOptions *table_options)
     {
         DefElem    *def = (DefElem *) lfirst(lc);
 
-        if (strcmp(def->defname, "uri") == 0)
+        if (strcmp(def->defname, URI_OPTION) == 0)
             table_options->uri = defGetString(def);
 
-        if (strcmp(def->defname, "api_key") == 0)
+        if (strcmp(def->defname, API_KEY_OPTION) == 0)
             table_options->api_key = defGetString(def);
 
-        if (strcmp(def->defname, "max_reqs_sec") == 0)
+        if (strcmp(def->defname, MAX_REQS_SEC_OPTION) == 0)
             table_options->max_reqs_sec = atoi(defGetString(def));
 
-        if (strcmp(def->defname, "max_reqs_day") == 0)
+        if (strcmp(def->defname, MAX_REQS_DAY_OPTION) == 0)
             table_options->max_reqs_day = atoi(defGetString(def));
     }
 
@@ -426,145 +532,6 @@ Counters * ocgeoGetCounters(struct ocgeoTableOptions *table_options) {
 
     return &entry->counters;
 }
-
-#if 0
-
-static void
-ocgeoGetForeignRelSize(PlannerInfo *root,
-    RelOptInfo *baserel,
-    Oid foreigntableid)
-{
-      /*
-       * Obtain relation size estimates for a foreign table. This is called at
-       * the beginning of planning for a query that scans a foreign table. root
-       * is the planner's global information about the query; baserel is the
-       * planner's information about this table; and foreigntableid is the
-       * pg_class OID of the foreign table. (foreigntableid could be obtained
-       * from the planner data structures, but it's passed explicitly to save
-       * effort.)
-       *
-       * This function should update baserel->rows to be the expected number of
-       * rows returned by the table scan, after accounting for the filtering
-       * done by the restriction quals. The initial value of baserel->rows is
-       * just a constant default estimate, which should be replaced if at all
-       * possible. The function may also choose to update baserel->width if it
-       * can compute a better estimate of the average result row width.
-       */
-
-    ocgeoTableOptions *fpinfo;
-    ListCell   *lc;
-
-
-    elog(DEBUG1, "entering function %s", __func__);
-
-    /*
-     * We use PgFdwRelationInfo to pass various information to subsequent
-     * functions.
-     */
-    fpinfo = (ocgeoFdwPlanState *) palloc0(sizeof(ocgeoFdwPlanState));
-    baserel->fdw_private = fpinfo;
-
-    /* Look up foreign-table catalog info. */
-    fpinfo->table = GetForeignTable(foreigntableid);
-    fpinfo->server = GetForeignServer(fpinfo->table->serverid);
-
-    /*
-     * Extract user-settable option values.  Note that per-table setting of
-     * use_remote_estimate overrides per-server setting.
-     */
-    fpinfo->use_remote_estimate = DEFAULT_FDW_USE_REMOTE_ESTIMATE;
-    fpinfo->fdw_startup_cost = DEFAULT_FDW_STARTUP_COST;
-    fpinfo->fdw_tuple_cost = DEFAULT_FDW_TUPLE_COST;
-    fpinfo->shippable_extensions = NIL;
-
-    foreach(lc, fpinfo->server->options)
-    {
-        DefElem    *def = (DefElem *) lfirst(lc);
-
-        if (strcmp(def->defname, "use_remote_estimate") == 0)
-            fpinfo->use_remote_estimate = defGetBoolean(def);
-        else if (strcmp(def->defname, "fdw_startup_cost") == 0)
-            fpinfo->fdw_startup_cost = strtod(defGetString(def), NULL);
-        else if (strcmp(def->defname, "fdw_tuple_cost") == 0)
-            fpinfo->fdw_tuple_cost = strtod(defGetString(def), NULL);
-    }
-    foreach(lc, fpinfo->table->options)
-    {
-        DefElem    *def = (DefElem *) lfirst(lc);
-
-        if (strcmp(def->defname, "use_remote_estimate") == 0)
-            fpinfo->use_remote_estimate = defGetBoolean(def);
-    }
-
-    /*
-     * Identify which baserestrictinfo clauses can be sent to the remote
-     * server and which can't.
-     */
-    classifyConditions(root, baserel, baserel->baserestrictinfo,
-        &fpinfo->remote_conds, &fpinfo->local_conds);
-
-    /*
-     * Identify which attributes will need to be retrieved from the remote
-     * server.  These include all attrs needed for joins or final output, plus
-     * all attrs used in the local_conds.  (Note: if we end up using a
-     * parameterized scan, it's possible that some of the join clauses will be
-     * sent to the remote and thus we wouldn't really need to retrieve the
-     * columns used in them.  Doesn't seem worth detecting that case though.)
-     */
-    fpinfo->attrs_used = NULL;
-    pull_varattnos((Node *) baserel->reltargetlist, baserel->relid,
-        &fpinfo->attrs_used);
-    foreach(lc, fpinfo->local_conds)
-    {
-        RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
-
-        pull_varattnos((Node *) rinfo->clause, baserel->relid,
-            &fpinfo->attrs_used);
-    }
-
-    /*
-     * Compute the selectivity and cost of the local_conds, so we don't have
-     * to do it over again for each path.  The best we can do for these
-     * conditions is to estimate selectivity on the basis of local statistics.
-     */
-    fpinfo->local_conds_sel = clauselist_selectivity(root,
-        fpinfo->local_conds,
-        baserel->relid,
-        JOIN_INNER,
-        NULL);
-
-    cost_qual_eval(&fpinfo->local_conds_cost, fpinfo->local_conds, root);
-
-        /*
-         * If the foreign table has never been ANALYZEd, it will have relpages
-         * and reltuples equal to zero, which most likely has nothing to do
-         * with reality.  We can't do a whole lot about that if we're not
-         * allowed to consult the remote server, but we can use a hack similar
-         * to plancat.c's treatment of empty relations: use a minimum size
-         * estimate of 10 pages, and divide by the column-datatype-based width
-         * estimate to get the corresponding number of tuples.
-         */
-    if (baserel->pages == 0 && baserel->tuples == 0)
-    {
-        baserel->pages = 10;
-        baserel->tuples =
-        (10 * BLCKSZ) / (baserel->width +
-            MAXALIGN(SizeofHeapTupleHeader));
-
-    }
-
-        /* Estimate baserel size as best we can with local statistics. */
-    set_baserel_size_estimates(root, baserel);
-
-        /* Fill in basically-bogus cost estimates for use later. */
-    estimate_path_cost_size(root, baserel, NIL, NIL,
-        &fpinfo->rows, &fpinfo->width,
-        &fpinfo->startup_cost,
-        &fpinfo->total_cost);
-
-}
-#endif
-
 
 #if PG_VERSION_NUM < 110000
 #define		GET_RELID_ATTNAME(foreignTableId, columnId) get_relid_attribute_name(foreignTableId, columnId)
@@ -674,7 +641,7 @@ static void
 ocgeoGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid)
 {
 
-    elog(DEBUG1,"entering function %s",__func__);
+    elog(DEBUG2,"entering function %s",__func__);
 
     ocgeoFdwPlanState *fplanstate;
     ocgeoTableOptions table_options;
@@ -715,7 +682,7 @@ ocgeoGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntablei
     ocgeoGetOptions(foreigntableid, &table_options);
 
     baserel->tuples = 1e10; /* number of tuples in relation (not considering restrictions) */
-    baserel->rows = 10; /* estimated number of tuples in the relation after restriction
+    baserel->rows = MAX_RESULTS_REQUESTED; /* estimated number of tuples in the relation after restriction
                            clauses have been applied (ie, output rows of a plan for it) */
     fplanstate->startup_cost = 25;
     fplanstate->total_cost = fplanstate->startup_cost + baserel->rows;
@@ -740,11 +707,9 @@ ocgeoGetForeignPaths(PlannerInfo *root,
                      RelOptInfo *baserel,
                      Oid foreigntableid)
 {
-    elog(DEBUG1,"entering function %s",__func__);
+    elog(DEBUG2,"entering function %s",__func__);
     ocgeoFdwPlanState *planstate = baserel->fdw_private;
 
-
-#if 1
     /* Try to find parameterized paths */
     List* possiblePaths = NIL;
     List* paths = findPaths(root, baserel, possiblePaths, planstate->startup_cost);
@@ -783,20 +748,8 @@ ocgeoGetForeignPaths(PlannerInfo *root,
 		/* Add the path without modification */
 		add_path(baserel, (Path *) path);
 	}
-#else
-        ForeignPath* path = 
-                 create_foreignscan_path(root, baserel,
-                                         NULL,      /* default pathtarget */
-                                         baserel->rows,
-                                         planstate->startup_cost,
-                                         planstate->total_cost,
-                                         NIL,       /* no pathkeys */
-                                         NULL,      /* no outer rel either */
-                                         NULL,        /* no extra plan */
-                                         NIL);     /* no fdw_private data */
-        add_path(baserel, (Path*) path);
-#endif
-    elog(DEBUG1,"exiting function %s",__func__);
+
+    elog(DEBUG2,"exiting function %s",__func__);
 }
 
 
@@ -814,14 +767,27 @@ static void printRestrictInfoList(List* l, Oid relid)
 
         if (!IsA(r->clause, OpExpr)) continue;
         OpExpr* e = IsA(r->clause, OpExpr) ? castNode(OpExpr, r->clause) : NULL;
-        /* appendStringInfo(&d, "[%d:%s]->", nodeTag(r->clause), e && get_opname(e->opno) ? get_opname(e->opno) : "NULL"); */
         int n = list_length(e->args);
         if (n<1) continue;
         Var* var = linitial_node(Var, e->args);
         Const* con = lsecond_node(Const, e->args);
 
-        appendStringInfo(&d, "[%s %s %d] ", GET_RELID_ATTNAME(relid, var->varattno), get_opname(e->opno), 
-               DatumGetInt32(con->constvalue));
+        appendStringInfo(&d, "(%s %s ", GET_RELID_ATTNAME(relid, var->varattno), get_opname(e->opno));
+        switch(var->vartype) {
+            case TEXTOID:
+            case VARCHAROID:
+                appendStringInfo(&d, "'%s')", TextDatumGetCString(con->constvalue));
+                break;
+            case INT4OID:
+            case INT2OID:
+                appendStringInfo(&d, "%d)", DatumGetInt32(con->constvalue));
+                break;
+            default:
+                appendStringInfo(&d, "..{%d})", var->vartype);
+                break;
+        }
+        if (lc != list_tail(l))
+                appendStringInfo(&d, " AND ");
     }
     elog(DEBUG1, "%s: %s", __func__, d.data);
     pfree(d.data);
@@ -911,7 +877,7 @@ ocgeoGetForeignPlan(PlannerInfo *root,
     Index       scan_relid = baserel->relid;
     List	   *colList;
 
-    elog(DEBUG1,"entering function %s, %d restrictions",__func__, list_length(baserel->baserestrictinfo));
+    elog(DEBUG2,"entering function %s, %d restrictions",__func__, list_length(baserel->baserestrictinfo));
 
     printRestrictInfoList(baserel->baserestrictinfo, foreigntableid);
     colList = ColumnList(baserel);
@@ -927,24 +893,6 @@ ocgeoGetForeignPlan(PlannerInfo *root,
     scan_clauses = extract_actual_clauses(scan_clauses, false);
     elog(DEBUG1,"%s, %d column list, %d scan clauses",__func__, list_length(colList), list_length(scan_clauses));
 
-    /* Extract the quals coming from a parameterized path, if any */
-    /*
-	if (best_path->path.param_info) {
-        List* qual_list = NIL;
-        ListCell* lc;
-		foreach(lc, scan_clauses) {
-			extractRestrictions(baserel->relids, lfirst_node(Expr, lc), &qual_list);
-		}
-		foreach(lc, qual_list) {
-            List* clause = lfirst_node(List, lc);
-            Assert(list_length(clause)==3);
-            Var* var = linitial_node(Var, clause);
-            char* op = (char*) lsecond(clause);
-            Expr* val = lthird_node(Expr, clause);
-        }
-	}
-    */
-
     /* Create the ForeignScan node */
     return make_foreignscan(tlist,
                             scan_clauses,
@@ -954,7 +902,7 @@ ocgeoGetForeignPlan(PlannerInfo *root,
                             NIL,    /* no custom tlist */
                             NIL,
                             outer_plan);
-    elog(DEBUG1,"exiting function %s",__func__);
+    elog(DEBUG2,"exiting function %s",__func__);
 }
 
 /*
@@ -1069,7 +1017,7 @@ ocgeoBeginForeignScan(ForeignScanState *node, int eflags)
     int min_confidence = 0;
     ocgeoForeignScanState *sstate;
     Oid foreignTableId = RelationGetRelid(node->ss.ss_currentRelation);
-    elog(DEBUG1,"entering function %s",__func__);
+    elog(DEBUG2,"entering function %s",__func__);
 
 
     /* Fetch options  */
@@ -1145,16 +1093,6 @@ ocgeoBeginForeignScan(ForeignScanState *node, int eflags)
         else if (strcmp(attName, "confidence")==0 && strcmp(op, ">=")==0) {
             min_confidence = DatumGetInt32(value);
         }
-
-		ColumnMapping *columnMapping;
-		bool		handleFound = false;
-
-		columnMapping = (ColumnMapping *) hash_search(sstate->columnMappingHash,
-                attName,
-													  HASH_ENTER,
-													  &handleFound);
-        elog(DEBUG1, "%s, param restr: %s (type:%d / valtype %d) %s", __func__, attName, 
-               columnMapping->columnTypeId, valueType, op);
     }
 
     sstate->qual_key = qual_key;
@@ -1166,8 +1104,10 @@ ocgeoBeginForeignScan(ForeignScanState *node, int eflags)
 
 
     /* OK, we connected. If this is an EXPLAIN, bail out now */
-    if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
+    if (eflags & EXEC_FLAG_EXPLAIN_ONLY) {
+        elog(DEBUG2,"exiting function %s",__func__);
         return;
+    }
 
     sstate->api = ocgeo_init(table_options.api_key, table_options.uri);
 
@@ -1175,7 +1115,7 @@ ocgeoBeginForeignScan(ForeignScanState *node, int eflags)
     if (sstate->qual_value != NULL) {
         Counters* stats       = ocgeoGetCounters(&table_options);
         ocgeo_params_t params = ocgeo_default_params();
-        params.limit          = 50; /* XXX: make this configurable?? */
+        params.limit          = MAX_RESULTS_REQUESTED;
         struct timeval start_time, end_time;
         double tmsec;
 
@@ -1183,22 +1123,22 @@ ocgeoBeginForeignScan(ForeignScanState *node, int eflags)
             params.min_confidence = sstate->min_confidence;
 
         gettimeofday(&start_time, NULL);
-        ocgeo_forward(sstate->api, sstate->qual_value, &params, &sstate->response);
+        bool ok = ocgeo_forward(sstate->api, sstate->qual_value, &params, &sstate->response);
         gettimeofday(&end_time, NULL);
         
         /* Update statistics */
         tmsec = (end_time.tv_sec - start_time.tv_sec)*1000 + (end_time.tv_usec - start_time.tv_usec)/1000.0L;
         stats->calls++;
         stats->total_time += tmsec;
-        if (ocgeo_response_ok(&sstate->response)) {
+        if (ok && ocgeo_response_ok(&sstate->response)) {
             stats->success_calls++;
             sstate->cursor   = sstate->response.results;
             stats->rate_info = sstate->response.rateInfo;
         }
-        elog(DEBUG1,"In %s API returned status: %d, results: %d, time: %.2lf msec",__func__,
-                sstate->response.status.code, sstate->response.total_results, tmsec);
+        elog(DEBUG1,"API %s returned status: %d, results: %d, time: %.2lf msec",
+                sstate->response.url, sstate->response.status.code, sstate->response.total_results, tmsec);
     }
-    
+    elog(DEBUG2,"exiting function %s",__func__);
 }
 
 /*
@@ -1375,18 +1315,20 @@ TupleTableSlot* ocgeoIterateForeignScan(ForeignScanState * node)
 static void
 ocgeoReScanForeignScan(ForeignScanState *node)
 {
-    elog(DEBUG1,"entering function %s",__func__);
+    elog(DEBUG2,"entering function %s",__func__);
     ocgeoEndForeignScan(node);
     ocgeoBeginForeignScan(node, 0);
+    elog(DEBUG2,"exiting function %s",__func__);
 }
 
 
 static void
 ocgeoEndForeignScan(ForeignScanState *node)
 {
-    elog(DEBUG1,"entering function %s",__func__);
+    elog(DEBUG2,"entering function %s",__func__);
     ocgeoForeignScanState* sstate = node->fdw_state;
     ocgeo_close(sstate->api);
+    elog(DEBUG2,"exiting function %s",__func__);
 }
 
 
@@ -1394,13 +1336,14 @@ void ocgeoExplainForeignScan (ForeignScanState * node, ExplainState * es)
 {
     ocgeoForeignScanState *sstate = node->fdw_state;
 
-    elog(DEBUG1, "Entering function %s", __func__);
+    elog(DEBUG2, "Entering function %s", __func__);
     StringInfo q = makeStringInfo();
     appendStringInfo(q, "q='%s'", sstate->qual_value);
     if (sstate->min_confidence)
         appendStringInfo(q, "&min_confidence='%d'", sstate->min_confidence);
 
     ExplainPropertyText("OpenCageData API query", q->data, es);
+    elog(DEBUG2,"exiting function %s",__func__);
 }
 
 
