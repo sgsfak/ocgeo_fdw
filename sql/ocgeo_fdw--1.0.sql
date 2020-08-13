@@ -17,7 +17,7 @@ CREATE OR REPLACE FUNCTION ocgeo_stats(OUT nbr_calls bigint, OUT nbr_failed bigi
     AS 'MODULE_PATHNAME', 'ocgeo_stats'
     LANGUAGE C IMMUTABLE STRICT;
 
-COMMENT ON FUNCTION ocgeo_stats(name)
+COMMENT ON FUNCTION ocgeo_stats()
  IS 'shows the stats of usage: number of API calls, number of failed ones, total nbr of seconds';
 
 CREATE FOREIGN DATA WRAPPER ocgeo_fdw

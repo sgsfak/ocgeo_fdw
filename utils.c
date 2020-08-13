@@ -17,6 +17,7 @@
 #include "parser/parsetree.h"
 #include "pg_config.h"
 #include "access/htup_details.h"
+#include "nodes/makefuncs.h"
 
 
 

@@ -976,6 +976,7 @@ ColumnMappingHash(Oid foreignTableId, List *columnList)
 
 typedef struct ocgeoForeignScanState {
     AttInMetadata *attinmeta;
+    Oid tableid; /* the foreign table relation id */
     char  *qual_key; /* this should be always QUERY_ATT_NAME */
     char  *qual_value;
     int min_confidence;
@@ -1011,10 +1012,10 @@ static void
 ocgeoBeginForeignScan(ForeignScanState *node, int eflags)
 {
     ocgeoTableOptions table_options;
-    char       *qual_key = NULL;
+    char       *qual_key   = NULL;
     char       *qual_value = NULL;
-    bool        pushdown = false;
-    int min_confidence = 0;
+    bool        pushdown   = false;
+    int min_confidence     = 0;
     ocgeoForeignScanState *sstate;
     Oid foreignTableId = RelationGetRelid(node->ss.ss_currentRelation);
     elog(DEBUG2,"entering function %s",__func__);
@@ -1034,6 +1035,7 @@ ocgeoBeginForeignScan(ForeignScanState *node, int eflags)
 
     /* Store the additional state info */
     sstate->attinmeta = TupleDescGetAttInMetadata(node->ss.ss_currentRelation->rd_att);
+    sstate->tableid = foreignTableId;
     sstate->api = NULL;
     sstate->columnList = columnList;
     sstate->columnMappingHash = columnMappingHash;
@@ -1102,12 +1104,14 @@ ocgeoBeginForeignScan(ForeignScanState *node, int eflags)
     elog(DEBUG1,"function %s qual: %s='%s' and confidence>=%d",__func__, qual_key, qual_value, min_confidence);
 
 
-
-    /* OK, we connected. If this is an EXPLAIN, bail out now */
+    /*
+     * Do nothing more in EXPLAIN (no ANALYZE) case.
+     */
     if (eflags & EXEC_FLAG_EXPLAIN_ONLY) {
         elog(DEBUG2,"exiting function %s",__func__);
         return;
     }
+
 
     sstate->api = ocgeo_init(table_options.api_key, table_options.uri);
 
@@ -1171,6 +1175,8 @@ TupleTableSlot* ocgeoIterateForeignScan(ForeignScanState * node)
 
     Oid foreignTableId = node->ss.ss_currentRelation->rd_node.relNode;
     TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
+    elog(DEBUG2, "entering %s Relid: %d", __func__, foreignTableId);
+
     /* EState         *estate = node->ss.ps.state; */
     /* MemoryContext   oldcontext = MemoryContextSwitchTo(estate->es_query_cxt); */
 
@@ -1193,6 +1199,7 @@ TupleTableSlot* ocgeoIterateForeignScan(ForeignScanState * node)
 
     /* no results or results finished */
     if (current_result == NULL) {
+        elog(DEBUG2,"exiting function %s",__func__);
         return slot;
     }
     sstate->cursor = current_result->next; /* move the cursor to the next result for next iteration */
@@ -1308,6 +1315,7 @@ TupleTableSlot* ocgeoIterateForeignScan(ForeignScanState * node)
 
     }
     ExecStoreVirtualTuple(slot);
+    elog(DEBUG2,"exiting function %s",__func__);
     return slot;
 }
 
