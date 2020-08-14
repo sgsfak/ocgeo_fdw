@@ -29,6 +29,8 @@
     },
     "tags": [
       "OpenCageData API Wrapper",
+      "opencage-api",
+      "geocoding",
       "foreign data wrapper"
    ]
 }

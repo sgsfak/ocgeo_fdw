@@ -23,3 +23,9 @@ endif
 
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
+ifndef MAJORVERSION
+MAJORVERSION := $(basename $(VERSION))
+endif
+ifeq (,$(findstring $(MAJORVERSION), 9.6 10 11 12 13))
+$(error PostgreSQL 9.6, 10, 11, 12, or 13 is required to compile this extension)
+endif
