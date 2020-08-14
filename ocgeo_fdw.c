@@ -21,6 +21,9 @@
 #include "access/htup_details.h"
 #include "access/reloptions.h"
 #include "access/sysattr.h"
+#if PG_VERSION_NUM >= 120000
+#include "access/table.h"
+#endif
 #include "access/xact.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_attribute.h"
@@ -49,13 +52,10 @@
 #if PG_VERSION_NUM < 120000
 #include "nodes/relation.h"
 #include "optimizer/var.h"
-#endif
-#if PG_VERSION_NUM >= 120000
+#else
 #include "optimizer/optimizer.h"
+#include "nodes/pathnodes.h"
 #endif
-// #include "nodes/pathnodes.h"
-#include "nodes/parsenodes.h"
-// #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/planmain.h"
 #include "optimizer/restrictinfo.h"
@@ -282,8 +282,8 @@ typedef Oid ocgeoHashKey;
  */
 typedef struct Counters
 {
-    int64             calls;         /* # of times executed */
-    int64             success_calls; /* # of times executed successfully */
+    int32             calls;         /* # of times executed */
+    int32             success_calls; /* # of times executed successfully */
     double            total_time;    /* total execution time, in msec */
     ocgeo_rate_info_t rate_info;     /* rate info, got from the most recent API call */
 } Counters;
@@ -296,7 +296,6 @@ typedef struct ocgeoHashEntry
 {
     ocgeoHashKey key;           /* hash key of entry - MUST BE FIRST */
     Counters    counters;       /* the statistics for this query */
-    slock_t     mutex;          /* protects the counters */
 } ocgeoHashEntry;
 
 
@@ -392,31 +391,48 @@ ocgeo_stats(PG_FUNCTION_ARGS)
     ocgeoHashEntry* hentry = hash_seq != NULL ? hash_seq_search(hash_seq) : NULL;
     if (hentry != NULL)    /* do when there is more left to send */
     {
-        char      **values;
-        HeapTuple tuple;
-        Datum     result;
-        int64     total_calls;
-        int64     failed_calls;
-        double    total_time_ms;
-        double    total_time;
+        char         **values;
+        HeapTuple    tuple;
+        Datum        result;
+        int32        total_calls;
+        int32        failed_calls;
+        double       total_time_ms;
+        double       total_time;
+        struct pg_tm *reset_timestamp;
 
         total_calls = hentry->counters.calls;
         failed_calls = total_calls - hentry->counters.success_calls;
         total_time_ms = hentry->counters.total_time;
         total_time = total_time_ms / 1000.0;
+        /* Convert the UNIX timestamp in the rate_info reset field to
+           tm UTC time. Postgres defines a pg_time_t type as an alias 
+           to 'int64' (see pgtime.h) to make sure it covers a wider date
+           range. Too bad that cJSON parses any integral value to 'int'
+           and therefore casting to pg_time_t does not yield any benefit, 
+           but maybe in the future? */
+        reset_timestamp = pg_gmtime((pg_time_t*) &hentry->counters.rate_info.reset);
+
         /*
          * Prepare a values array for building the returned tuple.
          * This should be an array of C strings which will
          * be processed later by the type input functions.
          */
-        values = (char **) palloc(3 * sizeof(char *));
+        values = (char **) palloc(6 * sizeof(char *));
         values[0] = (char *) palloc(16 * sizeof(char));
         values[1] = (char *) palloc(16 * sizeof(char));
-        values[2] = (char *) palloc(16 * sizeof(char));
+        values[2] = (char *) palloc(20 * sizeof(char));
+        values[3] = (char *) palloc(16 * sizeof(char));
+        values[4] = (char *) palloc(16 * sizeof(char));
+        values[5] = (char *) palloc(30 * sizeof(char));
 
-        snprintf(values[0], 16, "%ld", total_calls);
-        snprintf(values[1], 16, "%ld", failed_calls);
-        snprintf(values[2], 16, "%.2lf", total_time);
+        snprintf(values[0], 16, "%d", total_calls);
+        snprintf(values[1], 16, "%d", failed_calls);
+        snprintf(values[2], 20, "%.2lf", total_time);
+        snprintf(values[3], 16, "%d", hentry->counters.rate_info.limit);
+        snprintf(values[4], 16, "%d", hentry->counters.rate_info.remaining);
+        snprintf(values[5], 30, "%04d-%02d-%02d %02d:%02d:%0dZ", 
+            reset_timestamp->tm_year+1900, reset_timestamp->tm_mon, reset_timestamp->tm_mday,
+            reset_timestamp->tm_hour, reset_timestamp->tm_min, reset_timestamp->tm_sec);
 
         /* build a tuple */
         tuple = BuildTupleFromCStrings(attinmeta, values);
@@ -428,6 +444,9 @@ ocgeo_stats(PG_FUNCTION_ARGS)
         pfree(values[0]);
         pfree(values[1]);
         pfree(values[2]);
+        pfree(values[3]);
+        pfree(values[4]);
+        pfree(values[5]);
         pfree(values);
 
         SRF_RETURN_NEXT(funcctx, result);
