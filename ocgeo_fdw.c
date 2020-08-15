@@ -1047,7 +1047,6 @@ ocgeoBeginForeignScan(ForeignScanState *node, int eflags)
     Oid foreignTableId = RelationGetRelid(node->ss.ss_currentRelation);
     elog(DEBUG2,"entering function %s",__func__);
 
-
     /* Fetch options  */
     ocgeoGetOptions(foreignTableId, &table_options);
 
@@ -1128,47 +1127,44 @@ ocgeoBeginForeignScan(ForeignScanState *node, int eflags)
     sstate->qual_value = pushdown ? qual_value : NULL;
     sstate->min_confidence = min_confidence;
 
-    elog(DEBUG1,"function %s qual: %s='%s' and confidence>=%d",__func__, qual_key, qual_value, min_confidence);
-
-
     /*
      * Do nothing more in EXPLAIN (no ANALYZE) case.
      */
-    if (eflags & EXEC_FLAG_EXPLAIN_ONLY) {
+    if (eflags & EXEC_FLAG_EXPLAIN_ONLY || sstate->qual_value == NULL) {
         elog(DEBUG2,"exiting function %s",__func__);
         return;
     }
 
+    elog(DEBUG1,"function %s qual: %s='%s' and confidence>=%d",__func__, qual_key, qual_value, min_confidence);
 
     sstate->api = ocgeo_init(table_options.api_key, table_options.uri);
 
     /* Make a forward request, only if some restriction is given (pushed-down) */
-    if (sstate->qual_value != NULL) {
-        Counters* stats       = ocgeoGetCounters(&table_options);
-        ocgeo_params_t params = ocgeo_default_params();
-        params.limit          = MAX_RESULTS_REQUESTED;
-        struct timeval start_time, end_time;
-        double tmsec;
+    Counters* stats       = ocgeoGetCounters(&table_options);
+    ocgeo_params_t params = ocgeo_default_params();
+    params.limit          = MAX_RESULTS_REQUESTED;
+    struct timeval start_time, end_time;
+    double tmsec;
 
-        if (sstate->min_confidence)
-            params.min_confidence = sstate->min_confidence;
+    if (sstate->min_confidence)
+        params.min_confidence = sstate->min_confidence;
 
-        gettimeofday(&start_time, NULL);
-        bool ok = ocgeo_forward(sstate->api, sstate->qual_value, &params, &sstate->response);
-        gettimeofday(&end_time, NULL);
-        
+    gettimeofday(&start_time, NULL);
+    bool ok = ocgeo_forward(sstate->api, sstate->qual_value, &params, &sstate->response);
+    gettimeofday(&end_time, NULL);
+
         /* Update statistics */
-        tmsec = (end_time.tv_sec - start_time.tv_sec)*1000 + (end_time.tv_usec - start_time.tv_usec)/1000.0L;
-        stats->calls++;
-        stats->total_time += tmsec;
-        if (ok && ocgeo_response_ok(&sstate->response)) {
-            stats->success_calls++;
-            sstate->cursor   = sstate->response.results;
-            stats->rate_info = sstate->response.rateInfo;
-        }
-        elog(DEBUG1,"API %s returned status: %d, results: %d, time: %.2lf msec",
-                sstate->response.url, sstate->response.status.code, sstate->response.total_results, tmsec);
+    tmsec = (end_time.tv_sec - start_time.tv_sec)*1000 + (end_time.tv_usec - start_time.tv_usec)/1000.0L;
+    stats->calls++;
+    stats->total_time += tmsec;
+    if (ok && ocgeo_response_ok(&sstate->response)) {
+        stats->success_calls++;
+        sstate->cursor   = sstate->response.results;
+        stats->rate_info = sstate->response.rateInfo;
     }
+    elog(DEBUG1,"API %s returned status: %d, results: %d, time: %.2lf msec",
+        sstate->response.url, sstate->response.status.code, sstate->response.total_results, tmsec);
+    
     elog(DEBUG2,"exiting function %s",__func__);
 }
 
@@ -1373,11 +1369,16 @@ void ocgeoExplainForeignScan (ForeignScanState * node, ExplainState * es)
 
     elog(DEBUG2, "Entering function %s", __func__);
     StringInfo q = makeStringInfo();
-    appendStringInfo(q, "q='%s'", sstate->qual_value);
-    if (sstate->min_confidence)
-        appendStringInfo(q, "&min_confidence='%d'", sstate->min_confidence);
+    if (sstate->qual_value)
+        appendStringInfo(q, "q='%s'", sstate->qual_value);
+    else
+        appendStringInfo(q, "q=(null)");
 
+    if (sstate->min_confidence)
+        appendStringInfo(q, " min_confidence=%d", sstate->min_confidence);
+    
     ExplainPropertyText("OpenCageData API query", q->data, es);
+    
     elog(DEBUG2,"exiting function %s",__func__);
 }
 
