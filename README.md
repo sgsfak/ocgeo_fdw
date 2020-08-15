@@ -17,6 +17,8 @@ is typically in your PostgreSQL installation's bin directory. E.g. in a recent
 sudo apt-get install postgresql-server-dev-12
 ```
 
+Also `libcurl` should have been installed, for example [this package](https://packages.ubuntu.com/focal/libcurl4-openssl-dev) for Ubuntu, and please make sure that `curl-config` is in the `PATH`.
+
 Then it's a matter of running (GNU) make like so:
 
 ```bash
@@ -246,6 +248,13 @@ FROM temp;
 
 Here I am using a "Common Table Expression" (CTE) ([`WITH` query](https://www.postgresql.org/docs/12/queries-with.html)) to define the subquery `temp` to the foreign table which is then used in the main query.
 
+### Geometric information
+
+`ocgeo_fdw` uses the `POINT` and `BOX` [geometric data types](https://www.postgresql.org/docs/12/datatype-geometric.html) of PostgreSQL for the `geometry` and `bounds` JSON fields of the API response. This allows for more advanced queries using the various [geometric functions and operators](https://www.postgresql.org/docs/12/functions-geometry.html) of PostgreSQL..
+
+**Support for PostGIS in on plan..**
+
+
 ## Miscellaneous
 
 ### Debug messages
@@ -300,6 +309,7 @@ You can use this function as follows:
 
 The rate information is returned by the API server on each request so it is the most accurate,
 according to the most recent API call. On the other hand, the number of calls and total time 
-per session so they are "local" to the current PostgreSQL connection. So for example based on the
-above we see that we have 2482 remaining API calls in the current "day", and therefore we have
-made 2500 - 2482 = 8 requests, but only 4 of them were performed in the current session.
+are recorded per session so they are "local" to the current PostgreSQL connection. So, for 
+example, based on the above we see that we have 2482 remaining API calls in the current "day", 
+and therefore we have made 2500 - 2482 = 8 requests, but only 4 of them were performed in the 
+current session.
