@@ -34,7 +34,7 @@ CREATE EXTENSION ocgeo_fdw;
 ### Create a "Server"
 
 The server provides global information about the OpenCageData API. The only configuration 
-option is the API endpoint. The server can be defined as follows:
+option required is the API endpoint. The server can be defined as follows:
 
 ```sql
 CREATE SERVER ocdata_server FOREIGN DATA WRAPPER ocgeo_fdw 
@@ -159,7 +159,7 @@ Example:
 
 ## More advanced queries
 
-### How many cities named Paris exist over the world?
+### How many cities named Paris exist all over the world?
 
 ```sql
 > SELECT country, COUNT(*) FROM ocgdata_api WHERE q='paris' AND _type='city' GROUP BY country ORDER BY 2;
@@ -206,7 +206,47 @@ FROM users LEFT JOIN ocgdata_api ON q=users.address
 base table is updated you need to perform a `REFRESH MATERIALIZED VIEW users_locations` to
 recreate the contents of the view.
 
-## More stuff
+### Accessing the JSON results
+
+If the definition of the foreign table includes an attribute of type [JSONB](https://www.postgresql.org/docs/12/datatype-json.html), `ocgeo_fdw` will store the JSON result message there. This permits more information to be retrieved since there  are plenty PostgreSQL [operators and functions](https://www.postgresql.org/docs/12/functions-json.html) for processing JSON data. For example, we can get the `currency` information from the [`annotations` field](https://opencagedata.com/api#annotations) of the JSON result, as shown next:
+
+```sql
+WITH temp(js) AS 
+   (SELECT json_response FROM ocgdata_api WHERE q='taj mahal, India') 
+SELECT jsonb_pretty(js->'annotations'->'currency') AS currency
+FROM temp;
+```
+```
++---------------------------------+
+│            currency             │
++---------------------------------+
+│ {                               │
+│     "name": "Indian Rupee",     │
+│     "symbol": "₹",              │
+│     "subunit": "Paisa",         │
+│     "iso_code": "INR",          │
+│     "html_entity": "&#x20b9;",  │
+│     "iso_numeric": "356",       │
+│     "decimal_mark": ".",        │
+│     "symbol_first": 1,          │
+│     "subunit_to_unit": 100,     │
+│     "alternate_symbols": [      │
+│         "Rs",                   │
+│         "৳",                    │
+│         "૱",                   │
+│         "௹",                    │
+│         "रु",                    │
+│         "₨"                     │
+│     ],                          │
+│     "thousands_separator": ",", │
+│     "smallest_denomination": 50 │
+│ }                               │
++---------------------------------+
+```
+
+Here I am using a "Common Table Expression" (CTE) ([`WITH` query](https://www.postgresql.org/docs/12/queries-with.html)) to define the subquery `temp` to the foreign table which is then used in the main query.
+
+## Miscellaneous
 
 ### Debug messages
 
@@ -257,3 +297,9 @@ You can use this function as follows:
 |         4 |          0 |       3.09 |       2500 |           2482 | 2020-07-15 03:00:00+03 |
 +-----------+------------+------------+------------+----------------+------------------------+
 ```
+
+The rate information is returned by the API server on each request so it is the most accurate,
+according to the most recent API call. On the other hand, the number of calls and total time 
+per session so they are "local" to the current PostgreSQL connection. So for example based on the
+above we see that we have 2482 remaining API calls in the current "day", and therefore we have
+made 2500 - 2482 = 8 requests, but only 4 of them were performed in the current session.
