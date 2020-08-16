@@ -52,7 +52,8 @@ statement is necessary for configuring the API key used for the current user.
 
 ```sql
 CREATE USER MAPPING FOR current_user SERVER ocdata_server 
-       OPTIONS (api_key '6d0e711d72d74daeb2b0bfd2a5cdfdba');
+       OPTIONS (api_key '6d0e711d72d74daeb2b0bfd2a5cdfdba',
+                max_reqs_sec '1');
 ```
 *Please make sure that you are using the correct server name you have defined if you specified
 something different in the `CREATE SERVER` command*
@@ -63,12 +64,16 @@ the same, responses. The above can be used to check whether the FDW works proper
 register for the [free plan](https://opencagedata.com/pricing) to get a valid key for more 
 extensive testing purposes, or, better yet, become a customer!. 
 
-If you want to change the API key, you can use the following:
+> If you want to change the API key, you can use the following:
+> 
+> ```sql
+> ALTER USER MAPPING FOR current_user SERVER ocdata_server
+>       OPTIONS (SET api_key '<your API key>');
+> ```
 
-```sql
-ALTER USER MAPPING FOR current_user SERVER ocdata_server
-      OPTIONS (SET api_key '<your API key>');
-```
+The `max_reqs_sec` option is the maximum number of requests per second that according to the
+selected [plan](https://opencagedata.com/pricing) the user is allowed to make. This option is
+optional and defaults to 1 which is the corresponding value for the free plan.
 
 ### Create a "foreign table"
 The foreign table is a "virtual" table allowing to make requests to the OpenCageData API when used
@@ -191,10 +196,11 @@ For executing this, PostgreSQL will select a "nested loop" plan where for each r
 as many API requests as rows in the `users` table. 
 
 **Note: This may result in a large number of API requests sent in quick succession. The FDW
-currently does not perform any throttling according to the user's plan, so make sure that your
-current plan allows this. To check this, you need to have an estimate of the request latency
-and of course the current limits on your plan. For the latter, see the `ocgeo_stats` function
-described bellow.**
+performs a rate limiting mechanism to make sure that the maximum number of API calls per
+second do not exceed the user's plan, as configured by the `USER MAPPING`. But it
+currently does not perform any throttling with respect to the maximum number of calls 
+*per day*. To make sure that even this limitation is respected, you can use the 
+`ocgeo_stats` function described bellow.**
 
 If such command is used frequently, it may be a good idea to create a [`materialized` view](https://www.postgresql.org/docs/current/static/rules-materializedviews.html):
 

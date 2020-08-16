@@ -285,7 +285,15 @@ typedef struct Counters
     int32             calls;         /* # of times executed */
     int32             success_calls; /* # of times executed successfully */
     double            total_time;    /* total execution time, in msec */
+
     ocgeo_rate_info_t rate_info;     /* rate info, got from the most recent API call */
+
+    /* Rate limit information for implementing rate limiting using the "leaky bucket"
+       algorithm (https://en.wikipedia.org/wiki/Leaky_bucket) */
+    struct timeval ts; /* the (unix epoch) timestamp of the most recent API request */
+    int            tokens; /* how many requests are allowed to be made, recorded
+                              when the most recent API request was sent. */
+
 } Counters;
 
 /*
@@ -483,6 +491,10 @@ ocgeoGetOptions(Oid foreigntableid, ocgeoTableOptions *table_options)
     table_options->user_id = mapping->userid;
     table_options->server_id = server->serverid;
 
+    /* Default values: Free plan */
+    table_options->max_reqs_day = 2500;
+    table_options->max_reqs_sec = 1;
+
     options = NIL;
     options = list_concat(options, table->options);
     options = list_concat(options, server->options);
@@ -506,13 +518,6 @@ ocgeoGetOptions(Oid foreigntableid, ocgeoTableOptions *table_options)
             table_options->max_reqs_day = atoi(defGetString(def));
     }
 
-    /* Default values: Free plan */
-
-    if (!table_options->max_reqs_day)
-        table_options->max_reqs_day = 2500;
-
-    if (!table_options->max_reqs_day)
-        table_options->max_reqs_day = 1;
 }
 
 char* colnameFromTupleVar(Var* var, TupleDesc tupdesc)
@@ -554,6 +559,8 @@ Counters * ocgeoGetCounters(struct ocgeoTableOptions *table_options) {
     if (!found) {
         /* initialize new hashtable entry (key is already filled in) */
         entry->counters = (Counters) {0};
+        entry->counters.tokens = table_options->max_reqs_sec; 
+        gettimeofday(&entry->counters.ts, NULL);
     }
 
 
@@ -1016,6 +1023,11 @@ typedef struct ocgeoForeignScanState {
 
 } ocgeoForeignScanState;
 
+static bool
+submitRequestWithRateLimiter(struct ocgeo_api* api, const char* query, 
+    ocgeo_params_t* params, int max_reqs_per_second, Counters* stats,
+    ocgeo_response_t* response);
+
 /*
  * ocgeoBeginForeignScan :     Initiate access to the API
  * Begin executing a foreign scan. This is called during executor startup.
@@ -1143,27 +1155,15 @@ ocgeoBeginForeignScan(ForeignScanState *node, int eflags)
     Counters* stats       = ocgeoGetCounters(&table_options);
     ocgeo_params_t params = ocgeo_default_params();
     params.limit          = MAX_RESULTS_REQUESTED;
-    struct timeval start_time, end_time;
-    double tmsec;
 
     if (sstate->min_confidence)
         params.min_confidence = sstate->min_confidence;
 
-    gettimeofday(&start_time, NULL);
-    bool ok = ocgeo_forward(sstate->api, sstate->qual_value, &params, &sstate->response);
-    gettimeofday(&end_time, NULL);
-
-        /* Update statistics */
-    tmsec = (end_time.tv_sec - start_time.tv_sec)*1000 + (end_time.tv_usec - start_time.tv_usec)/1000.0L;
-    stats->calls++;
-    stats->total_time += tmsec;
-    if (ok && ocgeo_response_ok(&sstate->response)) {
-        stats->success_calls++;
+    bool ok = submitRequestWithRateLimiter(sstate->api, sstate->qual_value, 
+        &params, table_options.max_reqs_sec, stats, &sstate->response);
+    if (ok) {
         sstate->cursor   = sstate->response.results;
-        stats->rate_info = sstate->response.rateInfo;
     }
-    elog(DEBUG1,"API %s returned status: %d, results: %d, time: %.2lf msec",
-        sstate->response.url, sstate->response.status.code, sstate->response.total_results, tmsec);
     
     elog(DEBUG2,"exiting function %s",__func__);
 }
@@ -1537,3 +1537,75 @@ findPaths(PlannerInfo *root, RelOptInfo *baserel, List *possiblePaths, int start
     return result;
 }
 
+
+/* Find the difference two <timeval> variables in milliseconds.
+   Timeval is defined in <sys/time.h> as follows:
+    struct timeval {
+             time_t       tv_sec;   // seconds since Jan. 1, 1970 
+             suseconds_t  tv_usec;  // and microseconds 
+    }
+
+    The time_t and suseconds_t are integral types but system/hardware dependent
+    Normally to transform a timeval to milliseconds will require an <int64> but
+    here we are interested in the difference and we can assume that a <long> will
+    be adequate (which can be 32 or 64 bits)...
+*/
+#define TIMEVALDIFF(end,start) (((end).tv_sec - (start).tv_sec)*1000 + ((end).tv_usec - (start).tv_usec)/1000)
+
+#define MIN(a,b) ((a)<(b) ? (a) : (b))
+
+/* submits the request to the API server after making sure that
+ * the rate limits (Actual the maximum number of requests per 
+ * second) are not exceeded.
+ */
+bool submitRequestWithRateLimiter(struct ocgeo_api* api, const char* query, 
+    ocgeo_params_t* params, int max_reqs_per_second, Counters* stats,
+    ocgeo_response_t* response)
+{
+    int max_reqs_per_sec = max_reqs_per_second > 0 ? max_reqs_per_second : 1000;
+    int period = 1000 / max_reqs_per_sec;
+    int permits = 0;
+    struct timeval start_time, end_time;
+
+    gettimeofday(&start_time, NULL);
+    while(true) {
+        /* How many millis have passed since the last API request? */
+        long ival = TIMEVALDIFF(start_time, stats->ts);
+        Assert(ival >= 0); /* XXX: time "jump"? */
+        /* How many tokens we would have put in the "bucket" ? */
+        long tokens_since_last_req = ival / period;
+        permits = stats->tokens + tokens_since_last_req;
+        if (permits == 0) {
+            long delay = period - ival;
+            elog(DEBUG1,"[%s] Period: %dms, max rps: %d, time since last call: %ldms."
+                " Going to sleep for %ldms, zzz...",
+                __func__, period, max_reqs_per_sec, ival, delay);
+            pg_usleep(delay*1000L); /* pg_usleep needs microseconds */
+            gettimeofday(&start_time, NULL);
+        }
+        else {
+            elog(DEBUG1,"[%s] Period: %dms, max rps: %d, time since last call: %ldms, %d tokens.",
+                __func__, period, max_reqs_per_sec, ival, MIN(max_reqs_per_sec, permits));
+            break;
+        }
+    }
+    stats->tokens = MIN(max_reqs_per_sec, permits) - 1;
+    stats->ts = start_time;
+    bool ok = ocgeo_forward(api, query, params, response);
+    gettimeofday(&end_time, NULL);
+
+    long tm  = TIMEVALDIFF(end_time, start_time); /* How long did it take? */
+    elog(DEBUG1,"API %s returned status: %d, results: %d, time: %ld msec",
+        response->url, response->status.code, response->total_results, tm);
+
+        /* Update statistics */
+    stats->calls++;
+    stats->total_time += tm;
+    if (ok && ocgeo_response_ok(response)) {
+        stats->success_calls++;
+        stats->rate_info = response->rateInfo;
+        return true;
+    }
+
+    return false;
+}
