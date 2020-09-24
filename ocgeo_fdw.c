@@ -72,6 +72,9 @@
 #else
 #include "utils/jsonfuncs.h"
 #endif
+#if PG_VERSION_NUM >= 130000
+#include "common/hashfn.h"
+#endif
 
 #include "ocgeo_api.h"
 #include "cJSON.h"
