@@ -77,7 +77,7 @@ optional and defaults to 1 which is the corresponding value for the free plan.
 
 ### Create a "foreign table"
 The foreign table is a "virtual" table allowing to make requests to the OpenCageData API when used
-in SQL SELECT commands. The following is a typical definition that allows to all the informtion 
+in SQL SELECT commands. The following is a typical definition that allows to all the information 
 returned by the JSON API in the [`components` and `formatted` fields](https://opencagedata.com/api#formatted):
 
 ```sql
