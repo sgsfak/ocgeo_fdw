@@ -3,7 +3,7 @@
 This PostgreSQL extension implements a Foreign Data Wrapper (FDW) for the
 [OpenCageData API](https://opencagedata.com/api). 
 
-*Please note that this version of ocgeo_fdw works with PostgreSQL version 9.6, 10, 11, 12, and 13.*
+*Please note that this version of ocgeo_fdw works with PostgreSQL version 9.6, 10, 11, 12,  13, and 14.*
 
 ## Installation
 

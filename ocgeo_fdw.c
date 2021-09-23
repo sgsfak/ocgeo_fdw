@@ -1463,6 +1463,7 @@ findPaths(PlannerInfo *root, RelOptInfo *baserel, List *possiblePaths, int start
             break;
         }
     }
+    elog(DEBUG1, "[%s]: Attnum:%d, query level=%d, relids=%d", __func__, attnum,root->query_level, bms_num_members(root->all_baserels));
     if (attnum == InvalidAttrNumber)
         return result;
 

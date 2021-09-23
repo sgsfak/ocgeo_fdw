@@ -18,7 +18,11 @@
 #include "pg_config.h"
 #include "access/htup_details.h"
 #include "nodes/makefuncs.h"
-
+#if PG_VERSION_NUM >= 140000
+#define pull_varnos_compat(a,b) pull_varnos(a,b)
+#else
+#define pull_varnos_compat(a,b) pull_varnos(b)
+#endif
 
 
 /* Third argument to get_attname was introduced in [8237f27] (release 11) */
@@ -89,6 +93,7 @@ extractClauseFromOpExpr(Relids base_relids,
 {
 	Var		   *left;
 	Expr	   *right;
+    PlannerInfo root;
 
 	/* Use a "canonical" version of the op expression, to ensure that the */
 	/* left operand is a Var on our relation. */
@@ -100,7 +105,7 @@ extractClauseFromOpExpr(Relids base_relids,
 		/* Do not add it if it either contains a mutable function, or makes */
 		/* self references in the right hand side. */
 		if (!(contain_volatile_functions((Node *) right) ||
-			  bms_is_subset(base_relids, pull_varnos((Node *) right))))
+			  bms_is_subset(base_relids, pull_varnos_compat(&root, (Node *) right))))
 		{
 			*quals = lappend(*quals, 
                     list_make3(left, get_opname(op->opno), right));
